@@ -143,7 +143,7 @@ class GradeDataset(Dataset):
                 continue
             
             is_volume = self._parse_bool(attr.get("is_volume", False))
-            if not self.drop_volume and is_volume:
+            if self.drop_volume and is_volume:
                 continue
             
             polygon = list(zip(xs, ys))
@@ -210,17 +210,6 @@ class GradeDataset(Dataset):
             }
             
         return image_tensor, target
-    
-
-class RouteGrader(torch.nn.Module):
-    def __init__(self, num_classes):
-        super(RouteGrader, self).__init__()
-        self.model = torchvision.models.resnet18(pretrained=True)
-        self.model.fc = torch.nn.Linear(self.model.fc.in_features, num_classes)
-        
-    def forward(self, x):
-        x = self.model(x)
-        return x
 
 
 def visualize_gd_sample(image, target):
@@ -241,6 +230,32 @@ def visualize_gd_sample(image, target):
     plt.imshow(result)
     plt.title("Grade Sample")
     plt.show()
+    
+    
+def visualize_predictions(image_pil, gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores, idx_to_grade, score_threshold=0.3):
+    result = image_pil.convert("RGB").copy()
+    draw = ImageDraw.Draw(result)
+
+    for box, label in zip(gt_boxes, gt_labels):
+        x1, y1, x2, y2 = [int(v) for v in box]
+        grade = idx_to_grade.get(int(label), "BG")
+        draw.rectangle([x1, y1, x2, y2], outline="green", width=4)
+        draw.text((x1, max(0, y1 - 12)), f"GT: {grade}", fill="green")
+
+    for box, label, score in zip(pred_boxes, pred_labels, pred_scores):
+        if score < score_threshold:
+            continue
+        x1, y1, x2, y2 = [int(v) for v in box]
+        grade = idx_to_grade.get(int(label), "BG")
+        draw.rectangle([x1, y1, x2, y2], outline="red", width=4)
+        draw.text((x1, min(y2 + 2, result.height - 12)), f"Pred: {grade} ({score:.2f})", fill="red")
+
+    plt.figure(figsize=(14, 10))
+    plt.imshow(result)
+    plt.title("Green = GT, Red = Predicted")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.show()
 
 
 def collate_fn(batch):
@@ -248,9 +263,8 @@ def collate_fn(batch):
 
 
 def build_model(num_classes):
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn(
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn_v2(
         weights="DEFAULT",
-        weights_backbone="DEFAULT",
     )
     
     in_features_box = model.roi_heads.box_predictor.cls_score.in_features
@@ -296,20 +310,23 @@ val_size = dataset_size - train_size
 generator = torch.Generator().manual_seed(42)
 train_dataset, val_dataset = torch.utils.data.random_split(grade_dataset, [train_size, val_size], generator=generator)
 
+BATCH_SIZE = 2
+NUM_WORKERS = 2
+
 train_dataloader = DataLoader(
     train_dataset, 
-    batch_size=1, 
+    batch_size=BATCH_SIZE, 
     shuffle=True, 
     collate_fn=collate_fn,
-    num_workers=1
+    num_workers=NUM_WORKERS
 )
 
 val_dataloader = DataLoader(
     val_dataset, 
-    batch_size=1, 
+    batch_size=BATCH_SIZE, 
     shuffle=False, 
     collate_fn=collate_fn,
-    num_workers=1
+    num_workers=NUM_WORKERS
 )
 
 num_classes = len(grade_dataset.grade_to_idx) + 1
@@ -320,9 +337,8 @@ print(f"Grades: {grade_dataset.grade_to_idx}")
 model = build_model(num_classes).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 
-num_epochs = 5
+num_epochs = 15
 loss_history = []
-acc_history = []
 start_train_time = time.perf_counter()
 for epoch in range(num_epochs):
     model.train()
@@ -341,17 +357,31 @@ for epoch in range(num_epochs):
         train_loss += losses.item()
     
     avg_loss = train_loss / len(train_dataloader)
-    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+    
+    est_total_time = (time.perf_counter() - start_train_time) / (epoch + 1) * num_epochs
+    elapsed_time = time.perf_counter() - start_train_time
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Elapsed Time: {elapsed_time:.2f}s, Est. Time: {est_total_time:.2f}s")
     loss_history.append(avg_loss)
 end_train_time = time.perf_counter()
 print(f"Training completed in {(end_train_time - start_train_time):.2f} seconds")
 
+checkpoint = {
+    "model_state_dict": model.state_dict(),
+    "num_classes": num_classes,
+    "grade_to_idx": grade_dataset.grade_to_idx,
+    "idx_to_grade": grade_dataset.idx_to_grade,
+    "epoch": num_epochs,
+    "loss_history": loss_history,
+    "optimizer_state_dict": optimizer.state_dict()
+}
+torch.save(checkpoint, "route_grader_maskrcnn_checkpoint.pt")
+print("Saved checkpoint to route_grader_maskrcnn_checkpoint.pt")
 
 model.eval()
 all_true = []
 all_pred = []
 iou_threshold = 0.5
-score_threshold = 0.05
+score_threshold = 0.3
 no_detection_label = num_classes
 eval_start_time = time.perf_counter()
 with torch.no_grad():
@@ -399,19 +429,7 @@ with torch.no_grad():
             if pred_idx not in matched_pred:
                 all_true.append(no_detection_label)
                 all_pred.append(int(pred_labels[pred_idx]))
-                
-checkpoint = {
-    "model_state_dict": model.state_dict(),
-    "num_classes": num_classes,
-    "grade_to_idx": grade_dataset.grade_to_idx,
-    "idx_to_grade": grade_dataset.idx_to_grade,
-    "epoch": num_epochs,
-    "loss_history": loss_history,
-    "acc_history": acc_history,
-    "optimizer_state_dict": optimizer.state_dict()
-}
-torch.save(checkpoint, "route_grader_maskrcnn_checkpoint.pt")
-print("Saved checkpoint to route_grader_maskrcnn_checkpoint.pt")
+
 
 eval_labels = list(range(num_classes)) + [no_detection_label]
 CM = confusion_matrix(all_true, all_pred, labels=eval_labels)
@@ -429,13 +447,32 @@ end_eval_time = time.perf_counter()
 print(f"Evaluation completed in {(end_eval_time - eval_start_time):.2f} seconds")
 
 # visualize confusion matrix
-plt.figure(figsize=(10, 8))
+plt.figure(figsize=(12, 10))
 plt.imshow(CM, interpolation="nearest", cmap=plt.cm.Blues)
 plt.title("Confusion Matrix")
 plt.colorbar()
+
 tick_marks = np.arange(len(eval_labels))
-plt.xticks(tick_marks, [grade_dataset.idx_to_grade.get(lbl, "BG/ND") for lbl in eval_labels], rotation=45)
-plt.yticks(tick_marks, [grade_dataset.idx_to_grade.get(lbl, "BG/ND") for lbl in eval_labels])
+tick_names = []
+for lbl in eval_labels:
+    if lbl == 0:
+        tick_names.append("BG")
+    elif lbl == no_detection_label:
+        tick_names.append("No Det")
+    else:
+        tick_names.append(grade_dataset.idx_to_grade.get(lbl, str(lbl)))
+
+plt.xticks(tick_marks, tick_names, rotation=45, ha="right")
+plt.yticks(tick_marks, tick_names)
+
+thresh = CM.max() / 2.0
+for i in range(CM.shape[0]):
+    for j in range(CM.shape[1]):
+        plt.text(j, i, str(CM[i, j]),
+                 ha="center", va="center",
+                 color="white" if CM[i, j] > thresh else "black",
+                 fontsize=8)
+
 plt.xlabel("Predicted Label")
 plt.ylabel("True Label")
 plt.tight_layout()
@@ -443,27 +480,27 @@ plt.show()
 
 # visualize some predictions
 model.eval()
+val_iter = iter(val_dataloader)
 with torch.no_grad():
     for i in range(min(5, len(val_dataloader))):
-        images, targets = next(iter(val_dataloader))
+        images, targets = next(val_iter)
         images = [img.to(device) for img in images]
         outputs = model(images)
-        
+
         image_np = images[0].cpu().permute(1, 2, 0).numpy()
         image_pil = Image.fromarray((image_np * 255).astype(np.uint8))
-        
+
         gt_boxes = targets[0]["boxes"].cpu().numpy()
         gt_labels = targets[0]["labels"].cpu().numpy()
-        
+
         pred_boxes = outputs[0]["boxes"].detach().cpu().numpy()
         pred_labels = outputs[0]["labels"].detach().cpu().numpy()
         pred_scores = outputs[0]["scores"].detach().cpu().numpy()
-        
-        visualize_gd_sample(image_pil, {
-            "polygons": [], 
-            "route_ids": [], 
-            "grades": [grade_dataset.idx_to_grade.get(lbl.item() - 1, "BG") for lbl in gt_labels], 
-            "is_incomplete": [], 
-            "is_volume": []
-        })
-        
+
+        visualize_predictions(
+            image_pil,
+            gt_boxes, gt_labels,
+            pred_boxes, pred_labels, pred_scores,
+            grade_dataset.idx_to_grade,
+            score_threshold=0.3
+        )
