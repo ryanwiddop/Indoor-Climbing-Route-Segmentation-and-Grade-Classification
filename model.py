@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import logging
 from collections import defaultdict, Counter
 from datetime import datetime
 
@@ -38,9 +39,27 @@ RT_ID_COLOR_MAP = {
     16: "coral"
 }
 
-GD_TEST_IMG_PATH = "images"
-GD_TEST_ANN_PATH = "annotation.csv"
+GD_TEST_IMG_PATH = "/home/public/rwiddop/images/"
+GD_TEST_ANN_PATH = "/home/public/rwiddop/annotation.csv"
+LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "model.log")
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    file_handler = logging.FileHandler(LOG_FILE_PATH)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    logger.propagate = False
 
 class GradeDataset(Dataset):
     def __init__(self, img_dir, ann_csv, drop_incomplete=True, drop_volume=False):
@@ -313,7 +332,8 @@ def main():
     train_dataset, val_dataset = torch.utils.data.random_split(grade_dataset, [train_size, val_size], generator=generator)
 
     BATCH_SIZE = 2
-    NUM_WORKERS = 2
+    NUM_WORKERS = 16
+    NUM_EPOCHS = 100
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -333,17 +353,16 @@ def main():
 
     num_classes = len(grade_dataset.grade_to_idx) + 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    print(f"GPU compute capability: {torch.cuda.get_device_capability() if torch.cuda.is_available() else 'N/A'}")
-    print(f"Grades: {grade_dataset.grade_to_idx}")
+    logger.info(f"Using device: {device}")
+    logger.info(f"GPU compute capability: {torch.cuda.get_device_capability() if torch.cuda.is_available() else 'N/A'}")
+    logger.info(f"Grades: {grade_dataset.grade_to_idx}")
 
     model = build_model(num_classes).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 
-    num_epochs = 15
     loss_history = []
     start_train_time = time.perf_counter()
-    for epoch in range(num_epochs):
+    for epoch in range(NUM_EPOCHS):
         model.train()
         train_loss = 0.0
         for images, targets in train_dataloader:
@@ -361,24 +380,24 @@ def main():
 
         avg_loss = train_loss / len(train_dataloader)
 
-        est_total_time = (time.perf_counter() - start_train_time) / (epoch + 1) * num_epochs
+        est_total_time = (time.perf_counter() - start_train_time) / (epoch + 1) * NUM_EPOCHS
         elapsed_time = time.perf_counter() - start_train_time
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Elapsed Time: {elapsed_time:.2f}s, Est. Time: {est_total_time:.2f}s")
+        logger.info(f"Epoch {epoch+1}/{NUM_EPOCHS}, Loss: {avg_loss:.4f}, Elapsed Time: {elapsed_time:.2f}s, Est. Time: {est_total_time:.2f}s")
         loss_history.append(avg_loss)
     end_train_time = time.perf_counter()
-    print(f"Training completed in {(end_train_time - start_train_time):.2f} seconds")
+    logger.info(f"Training completed in {(end_train_time - start_train_time):.2f} seconds")
 
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "num_classes": num_classes,
         "grade_to_idx": grade_dataset.grade_to_idx,
         "idx_to_grade": grade_dataset.idx_to_grade,
-        "epoch": num_epochs,
+        "epoch": NUM_EPOCHS,
         "loss_history": loss_history,
         "optimizer_state_dict": optimizer.state_dict()
     }
-    torch.save(checkpoint, "route_grader_maskrcnn_checkpoint.pt")
-    print("Saved checkpoint to route_grader_maskrcnn_checkpoint.pt")
+    torch.save(checkpoint, "checkpoints/route_grader_maskrcnn_checkpoint.pt")
+    logger.info("Saved checkpoint to checkpoints/route_grader_maskrcnn_checkpoint.pt")
 
     model.eval()
     all_true = []
@@ -438,15 +457,15 @@ def main():
     acc = float(np.mean(np.array(all_true) == np.array(all_pred))) if all_true else 0.0
     report = classification_report(all_true, all_pred, labels=eval_labels, zero_division=0, digits=4)
 
-    print("Confusion Matrix:")
-    print(CM)
-    print(f"Accuracy: {acc:.4f}")
-    print(f"No-detection label index: {no_detection_label}")
-    print("Classification report:")
-    print(report)
+    logger.info("Confusion Matrix:")
+    logger.info(CM)
+    logger.info(f"Accuracy: {acc:.4f}")
+    logger.info(f"No-detection label index: {no_detection_label}")
+    logger.info("Classification report:")
+    logger.info(report)
 
     end_eval_time = time.perf_counter()
-    print(f"Evaluation completed in {(end_eval_time - eval_start_time):.2f} seconds")
+    logger.info(f"Evaluation completed in {(end_eval_time - eval_start_time):.2f} seconds")
 
     # visualize confusion matrix
     plt.figure(figsize=(12, 10))
@@ -478,9 +497,9 @@ def main():
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
     plt.tight_layout()
-    plt.savefig("confusion_matrix.png", dpi=200, bbox_inches="tight")
+    plt.savefig("figures/confusion_matrix.png", dpi=200, bbox_inches="tight")
     plt.close()
-    
+    logger.info("Saved confusion matrix to figures/confusion_matrix.png")
     # visualize some predictions
     model.eval()
     val_iter = iter(val_dataloader)
@@ -506,7 +525,7 @@ def main():
                 pred_boxes, pred_labels, pred_scores,
                 grade_dataset.idx_to_grade,
                 score_threshold=0.3,
-                output_name=f"prediction_{i+1}.png"
+                output_name=f"figures/prediction_{i+1}.png"
             )
 
 
