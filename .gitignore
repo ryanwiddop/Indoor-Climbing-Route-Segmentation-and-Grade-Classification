@@ -1,3 +1,6 @@
 *.jpg
 *.csv
 *.pt
+
+eval_outputs/
+__pycache__/
