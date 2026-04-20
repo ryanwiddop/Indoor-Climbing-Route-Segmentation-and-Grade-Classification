@@ -31,7 +31,7 @@ CROPPED_IMG_PATH = "/home/public/rwiddop/cropped/crops/"
 CROPPED_ANN_PATH = "/home/public/rwiddop/cropped/crops.csv"
 LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "logs/phase_1.log")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints/phase_1.pt")
-FIGURES_PATH = os.path.join(os.path.dirname(__file__), "figures")
+FIGURES_PATH = os.path.join(os.path.dirname(__file__), "figures/phase_1/train")
 
 
 def ensure_output_dirs():
