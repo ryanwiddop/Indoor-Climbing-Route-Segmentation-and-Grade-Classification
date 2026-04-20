@@ -78,6 +78,8 @@ for _, row in annotations.iterrows():
     rows_by_img[row["filename"]].append(row)
     
 skipped_images = 0
+full_img_widths = []
+full_img_heights = []
 crop_widths = []
 crop_heights = []
 
@@ -94,6 +96,8 @@ with open(crops_csv_path, "w", newline="") as f:
 
         image = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
         w, h = image.size
+        full_img_widths.append(w)
+        full_img_heights.append(h)
         img_stem = os.path.splitext(img_name)[0]
         
         rows = rows_by_img.get(img_name, [])
@@ -165,3 +169,5 @@ print(f"Crops DIR:      {crops_dir}")
 print(f"Crops CSV:      {crops_csv_path}")
 print(f"Avg. Widths:    {sum(crop_widths) / len(crop_widths):.2f}")
 print(f"Crop Heights:   {sum(crop_heights) / len(crop_heights):.2f}")
+print(f"Full Img Widths: {sum(full_img_widths) / len(full_img_widths):.2f}")
+print(f"Full Img Heights:{sum(full_img_heights) / len(full_img_heights):.2f}")
