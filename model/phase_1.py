@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import logging
 import time
@@ -22,13 +23,17 @@ import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 
-try:
-    from .cropped_hold_dataset import HoldDataset, collate_fn
-except ImportError:
-    from cropped_hold_dataset import HoldDataset, collate_fn
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-CROPPED_IMG_PATH = "/home/public/rwiddop/cropped/crops/"
-CROPPED_ANN_PATH = "/home/public/rwiddop/cropped/crops.csv"
+try:
+    from ..datasets.tiled_wall_dataset import TiledWallDataset, collate_fn
+except ImportError:
+    from datasets.tiled_wall_dataset import TiledWallDataset, collate_fn
+
+TILED_IMG_PATH = "/home/public/rwiddop/tiled/tiles/"
+TILED_ANN_PATH = "/home/public/rwiddop/tiled/tiles.csv"
 LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "logs/phase_1.log")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints/phase_1.pt")
 FIGURES_PATH = os.path.join(os.path.dirname(__file__), "figures/phase_1/train")
@@ -149,7 +154,7 @@ def visualize_predictions(image_pil, gt_boxes, gt_labels, pred_boxes, pred_label
 def main():
     mp.set_start_method("spawn", force=True)
     
-    hold_dataset = HoldDataset(CROPPED_IMG_PATH, CROPPED_ANN_PATH)
+    hold_dataset = TiledWallDataset(TILED_IMG_PATH, TILED_ANN_PATH)
     
     dataset_size = len(hold_dataset)
     train_size = int(0.8 * dataset_size)
@@ -255,7 +260,7 @@ def main():
             loss_history.append(avg_train_loss)
             
             epoch_time = time.perf_counter() - last_epoch_time
-            logger.info(f"Epoch {epoch+1}/{NUM_EPOCHS} - Train Loss: {avg_train_loss:.4f} - Epoch Time: {epoch_time:.2f} seconds")
+            # logger.info(f"Epoch {epoch+1}/{NUM_EPOCHS} - Train Loss: {avg_train_loss:.4f} - Epoch Time: {epoch_time:.2f} seconds")
             last_epoch_time = time.perf_counter()
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
