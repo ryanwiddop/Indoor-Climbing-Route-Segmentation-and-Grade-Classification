@@ -20,6 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.amp import GradScaler, autocast
 import torch.multiprocessing as mp
 import torchvision
+import torchvision.transforms as T
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 
@@ -155,20 +156,26 @@ def main():
     mp.set_start_method("spawn", force=True)
     
     hold_dataset = TiledWallDataset(TILED_IMG_PATH, TILED_ANN_PATH)
-    
+
     dataset_size = len(hold_dataset)
     train_size = int(0.8 * dataset_size)
     val_size = dataset_size - train_size
-    
+
     generator = torch.Generator().manual_seed(42)
-    train_dataset, val_dataset = torch.utils.data.random_split(hold_dataset, [train_size, val_size], generator=generator)
+    indices = torch.randperm(dataset_size, generator=generator).tolist()
+    train_indices, val_indices = indices[:train_size], indices[train_size:]
+
+    train_base = TiledWallDataset(TILED_IMG_PATH, TILED_ANN_PATH, augment=True)
+    val_base   = TiledWallDataset(TILED_IMG_PATH, TILED_ANN_PATH, augment=False)
+    train_dataset = torch.utils.data.Subset(train_base, train_indices)
+    val_dataset   = torch.utils.data.Subset(val_base,   val_indices)
     logger.info(f"Dataset size: {dataset_size}, Train size: {train_size}, Val size: {val_size}")
 
     
     BATCH_SIZE = 16
     NUM_WORKERS = 8
-    NUM_EPOCHS = 30
-    
+    NUM_EPOCHS = 45
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
@@ -197,9 +204,9 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-5)
     
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=[20, 27], gamma=0.1
+        optimizer, milestones=[30, 40], gamma=0.1
     )
-    
+
     scaler = GradScaler("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = False
     
@@ -280,60 +287,71 @@ def main():
     logger.info(f"Model checkpoint saved to {CHECKPOINT_PATH}")
     
     model.eval()
-    all_true = []
-    all_pred = []
     iou_threshold = 0.5
-    score_threshold = 0.3
     no_detection_label = num_classes
+
+    all_raw = []
     start_time = time.perf_counter()
     with torch.no_grad():
         for images, targets in val_loader:
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-            
             outputs = model(images)
             for target, output in zip(targets, outputs):
-                gt_boxes = target["boxes"].cpu().numpy()
-                gt_labels = target["labels"].cpu().numpy()
-                
-                pred_boxes = output["boxes"].cpu().numpy()
-                pred_labels = output["labels"].cpu().numpy()
-                pred_scores = output["scores"].cpu().numpy()
-                
-                matched_gt = set()
-                for pb, pl, ps in zip(pred_boxes, pred_labels, pred_scores):
-                    if ps < score_threshold:
+                all_raw.append((
+                    target["boxes"].cpu().numpy(),
+                    target["labels"].cpu().numpy(),
+                    output["boxes"].cpu().numpy(),
+                    output["labels"].cpu().numpy(),
+                    output["scores"].cpu().numpy(),
+                ))
+    logger.info(f"Validation inference completed in {time.perf_counter() - start_time:.2f} seconds")
+
+    def score_threshold(threshold):
+        all_true, all_pred = [], []
+        for gt_boxes, gt_labels, pred_boxes, pred_labels, pred_scores in all_raw:
+            matched_gt = set()
+            for pb, pl, ps in zip(pred_boxes, pred_labels, pred_scores):
+                if ps < threshold:
+                    continue
+                best_iou, best_gt_idx = 0.0, -1
+                for idx, (gb, gl) in enumerate(zip(gt_boxes, gt_labels)):
+                    if idx in matched_gt:
                         continue
-                    
-                    best_iou = 0.0
-                    best_gt_idx = -1
-                    for idx, (gb, gl) in enumerate(zip(gt_boxes, gt_labels)):
-                        if idx in matched_gt:
-                            continue
-                        iou = box_iou(pb, gb)
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_gt_idx = idx
-                    
-                    
-                    if best_iou >= iou_threshold and best_gt_idx != -1 and pl == gt_labels[best_gt_idx]:
-                        all_true.append(pl)
-                        all_pred.append(pl)
-                        matched_gt.add(best_gt_idx)
-                    else:
-                        all_true.append(no_detection_label)
-                        all_pred.append(pl)
-                
-                for idx, gl in enumerate(gt_labels):
-                    if idx not in matched_gt:
-                        all_true.append(gl)
-                        all_pred.append(no_detection_label)
-    end_time = time.perf_counter()
-    elapsed_time = end_time - start_time
-    logger.info(f"Validation completed in {elapsed_time:.2f} seconds")
-    
+                    iou = box_iou(pb, gb)
+                    if iou > best_iou:
+                        best_iou, best_gt_idx = iou, idx
+                if best_iou >= iou_threshold and best_gt_idx != -1 and pl == gt_labels[best_gt_idx]:
+                    all_true.append(pl)
+                    all_pred.append(pl)
+                    matched_gt.add(best_gt_idx)
+                else:
+                    all_true.append(no_detection_label)
+                    all_pred.append(pl)
+            for idx, gl in enumerate(gt_labels):
+                if idx not in matched_gt:
+                    all_true.append(gl)
+                    all_pred.append(no_detection_label)
+        return all_true, all_pred
+
     eval_labels = list(range(num_classes)) + [no_detection_label]
-    report = classification_report(all_true, all_pred, labels=eval_labels, zero_division=0)    
+    best_f1, best_threshold, best_true, best_pred = 0.0, 0.3, [], []
+    for thresh in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+        t, p = score_threshold(thresh)
+        cm = confusion_matrix(t, p, labels=eval_labels)
+        tp = np.trace(cm) - cm[eval_labels.index(0), eval_labels.index(0)]
+        precision = tp / max(1, sum(cm[:, 1]))
+        recall = tp / max(1, sum(cm[1, :]))
+        f1 = 2 * precision * recall / max(1e-9, precision + recall)
+        acc = np.trace(cm) / np.sum(cm)
+        logger.info(f"  thresh={thresh:.1f}  precision={precision:.3f}  recall={recall:.3f}  f1={f1:.3f}  acc={acc:.4f}")
+        if f1 > best_f1:
+            best_f1, best_threshold, best_true, best_pred = f1, thresh, t, p
+
+    logger.info(f"Best threshold: {best_threshold} (F1={best_f1:.3f})")
+    all_true, all_pred = best_true, best_pred
+
+    report = classification_report(all_true, all_pred, labels=eval_labels, zero_division=0)
     conf_matrix = confusion_matrix(all_true, all_pred, labels=eval_labels)
     acc = np.trace(conf_matrix) / np.sum(conf_matrix)
     logger.info(f"Classification Report:\n{report}")
@@ -380,7 +398,7 @@ def main():
     plt.title("Training Loss Curve (Avg.)")
     plt.xlabel("Epoch")
     plt.ylabel("Total Loss")
-    plt.xticks(range(1, NUM_EPOCHS + 1))
+    plt.xticks(range(1, NUM_EPOCHS + 1, max(1, NUM_EPOCHS // 15)))
     plt.grid()
     plt.tight_layout()
     plt.savefig(FIGURES_PATH + "/phase_1_loss_curve.png", dpi=200, bbox_inches="tight")
@@ -411,7 +429,7 @@ def main():
                 gt_boxes, gt_labels,
                 pred_boxes, pred_labels, pred_scores,
                 hold_dataset.idx_to_hold_type,
-                score_threshold=0.3,
+                score_threshold=0.6,
                 output_name=f"{FIGURES_PATH}/prediction_{i+1}.png"
             )
 
