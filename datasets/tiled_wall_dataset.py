@@ -86,7 +86,8 @@ class TiledWallDataset(Dataset):
     def __len__(self):
         return len(self.tiles)
     
-    def _json(self, s):
+    @staticmethod
+    def _json(s):
         if not isinstance(s, str) or s.strip() in ("", "[]", "{}"):
             return {}
         try:
@@ -97,7 +98,8 @@ class TiledWallDataset(Dataset):
             except (ValueError, SyntaxError):
                 return {}
             
-    def _parse_bool(self, s):
+    @staticmethod
+    def _parse_bool(s):
         if isinstance(s, bool):
             return s
         if isinstance(s, str):
