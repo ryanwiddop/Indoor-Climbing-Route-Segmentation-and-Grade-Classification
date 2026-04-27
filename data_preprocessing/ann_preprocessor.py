@@ -1,4 +1,5 @@
 import os, csv, json, sys
+import matplotlib.pyplot as plt
 
 path = sys.argv[1]
 out = sys.argv[2]
@@ -59,6 +60,7 @@ def normalize_attr_value(value, field_name=None):
 
 hold_counts = 0
 route_counts = 0
+image_counts = 0
 grade_distribution = {}
 output_rows = []
 
@@ -86,7 +88,7 @@ def report_route_conflicts(image_name, routes):
             print(f"{image_name} - Route {route_id} has conflicting attributes:")
             print("  Grade\t| Inc.\t| Volume\t| Regions")
             for attr, region_ids in sorted(route_attrs.items(), key=lambda item: str(item[0])):
-                print(f"    {attr[0]}\t| {attr[1]}\t| {attr[2]}\t| {sorted(region_ids)}")
+                print(f"    {attr[0]}\t| {attr[1]}\t| {attr[2]}\t| {[(int(rid) + 1) for rid in sorted(region_ids)]}")
 
             majority_count = max(len(region_ids) for region_ids in route_attrs.values())
             outliers = [
@@ -97,7 +99,7 @@ def report_route_conflicts(image_name, routes):
             if outliers:
                 print("  Outlier region_ids:")
                 for attr, region_ids in sorted(outliers, key=lambda item: str(item[0])):
-                    print(f"    {region_ids} -> {attr}")
+                    print(f"    {[int(rid) + 1 for rid in region_ids]} -> {attr}")
 
 # csv format: filename,file_size,file_attributes,region_count,region_id,region_shape_attributes,region_attributes
 # Ex: 00.jpg,8294565,"{}",187,0,"{""name"":""polygon"",""all_points_x"":[2406,2416,2421,2422,2415,2406,2395,2391,2389,2395,2402],""all_points_y"":[1670,1667,1659,1648,1639,1637,1640,1648,1658,1666,1671]}","{""route_id"":""1"",""route_grade"":""VB"",""incomplete_route"":""true"",""is_volume"":""false""}"
@@ -111,12 +113,12 @@ with open(path, "r") as f:
 
     for row in reader:
         hold_counts += 1
-        
         img_name = row["filename"]
 
         if current_image is None:
             current_image = img_name
         elif img_name != current_image:
+            image_counts += 1
             report_route_conflicts(current_image, routes)
             update_grade_distribution_for_routes(routes, grade_distribution)
             route_counts += len(image_route_ids)
@@ -138,17 +140,22 @@ with open(path, "r") as f:
         is_volume = normalize_attr_value(attr.get("is_volume", False), "is_volume")
         hold_type = normalize_attr_value(attr.get("hold_type", "hold"), "hold_type")
         
-        if route_grade == "INC" or route_grade == "A":
+        if route_grade in ["INC", "A"]:
             normalized_route_grade = None
+        elif route_grade in ["VB", "V0"]:
+            normalized_route_grade = "V0-"
+        elif route_grade in ["V8", "V9", "V10", "V11", "V12"]:
+            normalized_route_grade = "V8+"
         else:
             normalized_route_grade = route_grade
+
         if incomplete_route is True and normalized_route_grade is None:
             normalized_route_grade = "INC"
 
         normalized_attr = {"route_id": route_id, "route_grade": normalized_route_grade, "incomplete_route": incomplete_route, "is_volume": is_volume, "hold_type": hold_type}
         
         if not xs or not ys or len(xs) != len(ys):
-            print(f"{img_name}:{region_id} - Unannotated image")
+            print(f"{img_name}:{int(region_id) + 1} - Unannotated image")
             continue
         
         if route_id is not None:
@@ -163,20 +170,20 @@ with open(path, "r") as f:
             routes[route_id][route_attr_tuple].append(region_id)
         
         if route_id is None and normalized_route_grade is None and incomplete_route is None and is_volume is None and hold_type is None:
-            print(f"{img_name}:{region_id} - Missing route attributes")
+            print(f"{img_name}:{int(region_id) + 1} - Missing route attributes")
         if route_id is None and is_volume is False:
-            print(f"{img_name}:{region_id} - Missing route_id")
+            print(f"{img_name}:{int(region_id) + 1} - Missing route_id")
         if normalized_route_grade is None and is_volume is False and incomplete_route is False:
-            print(f"{img_name}:{region_id} - Missing route_grade")
+            print(f"{img_name}:{int(region_id) + 1} - Missing route_grade")
         if route_id is not None and normalized_route_grade is None and incomplete_route is False and is_volume is False:
-            print(f"{img_name}:{region_id} - Missing route_grade")
+            print(f"{img_name}:{int(region_id) + 1} - Missing route_grade")
         if incomplete_route is True and normalized_route_grade != "INC":
-            print(f"{img_name}:{region_id} - Incomplete route should not have a grade")
+            print(f"{img_name}:{int(region_id) + 1} - Incomplete route should not have a grade")
             print(f"  Attributes: route_id={route_id}, route_grade={normalized_route_grade}, incomplete_route={incomplete_route}, is_volume={is_volume}")
         if hold_type is None:
-            print(f"{img_name}:{region_id} - Missing hold_type")
+            print(f"{img_name}:{int(region_id) + 1} - Missing hold_type")
         if hold_type not in ["hold", "volume", "pinch", "jug", "sloper", "crimp", "edge", "pocket"]:
-            print(f"{img_name}:{region_id} - Unrecognized hold_type: {hold_type}")
+            print(f"{img_name}:{int(region_id) + 1} - Unrecognized hold_type: {hold_type}")
 
         # csv format: filename,file_size,file_attributes,region_count,region_id,region_shape_attributes,region_attributes
         # Ex: 00.jpg,8294565,"{}",187,0,"{""name"":""polygon"",""all_points_x"":[2406,2416,2421,2422,2415,2406,2395,2391,2389,2395,2402],""all_points_y"":[1670,1667,1659,1648,1639,1637,1640,1648,1658,1666,1671]}","{""route_id"":""1"",""route_grade"":""VB"",""incomplete_route"":""true"",""is_volume"":""false""}"
@@ -195,7 +202,8 @@ with open(path, "r") as f:
 
     if current_image is not None:
         route_counts += len(image_route_ids)
-        
+        image_counts += 1
+
 with open(out, "w", newline="") as f:
     fieldnames = [
         "filename",
@@ -213,6 +221,28 @@ with open(out, "w", newline="") as f:
 
 print(f"Total holds: {hold_counts}")
 print(f"Total routes: {route_counts}")
+print(f"Total images: {image_counts}")
 print("Grade distribution:")
 for grade, count in sorted(grade_distribution.items(), key=lambda item: (item[0] is None, item[0])):
     print(f"  {grade}: {count}")
+    
+# visualize grade distribution as a bar chart
+GRADE_ORDER = ["VB", "V0", "V0-", "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V8+", "V9", "V10", "V11", "V12", "INC"]
+ordered_grades = [g for g in GRADE_ORDER if g in grade_distribution]
+other_grades = [g for g in grade_distribution if g not in GRADE_ORDER]
+all_grades = ordered_grades + sorted(other_grades, key=lambda g: (g is None, str(g)))
+counts = [grade_distribution[g] for g in all_grades]
+labels = [str(g) if g is not None else "None" for g in all_grades]
+
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.bar(labels, counts)
+ax.set_xlabel("Grade")
+ax.set_ylabel("Route Count")
+ax.set_title("Grade Distribution")
+plt.tight_layout()
+
+figures_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
+os.makedirs(figures_dir, exist_ok=True)
+fig_path = os.path.join(figures_dir, "grade_distribution.png")
+fig.savefig(fig_path)
+print(f"Grade distribution chart saved to {fig_path}")
