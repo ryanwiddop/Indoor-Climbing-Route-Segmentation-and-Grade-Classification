@@ -1,4 +1,5 @@
 *.jpg
+*.png
 *.csv
 *.pt
 *.log
@@ -8,3 +9,5 @@ __pycache__/
 figures/
 logs/
 checkpoints/
+
+CLAUDE.md
