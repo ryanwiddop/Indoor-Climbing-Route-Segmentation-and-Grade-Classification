@@ -4,7 +4,8 @@
 
 This project is an honors thesis project at The University of Massachusetts Lowell. The goal of this project is to create a dataset consisting of images of indoor rock climbing (bouldering) walls, then train a machine learning model to segment and classify routes by V grade.
 
-The pipeline is split into two phases. The first phase trains a Mask R-CNN model to detect and classify individual holds on a wall image. The second phase takes those detections and attempts to group them into complete routes using spatial reasoning and color-based binning. Ultimately the routes would be classified by their V grade.
+The pipeline is split into four phases. Phase 1 trains a Mask R-CNN model to detect and classify individual holds on a wall image. Phase 2 assigns each detected hold a color using CIELab-based binning. Phase 3 groups same-color holds into candidate routes via DBSCAN spatial clustering and DFS tracing. Phase 4 classifies each route by V-grade.
+
 
 ## Dataset
 
