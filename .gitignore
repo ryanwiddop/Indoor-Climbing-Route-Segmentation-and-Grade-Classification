@@ -3,6 +3,7 @@
 *.csv
 *.pt
 *.log
+*.json
 
 eval_outputs/
 __pycache__/
