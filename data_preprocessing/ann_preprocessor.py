@@ -142,10 +142,10 @@ with open(path, "r") as f:
         
         if route_grade in ["INC", "A"]:
             normalized_route_grade = None
-        elif route_grade in ["VB", "V0"]:
-            normalized_route_grade = "V0-"
-        elif route_grade in ["V8", "V9", "V10", "V11", "V12"]:
-            normalized_route_grade = "V8+"
+        # elif route_grade in ["VB", "V0"]:
+        #     normalized_route_grade = "V0-"
+        # elif route_grade in ["V8", "V9", "V10", "V11", "V12"]:
+        #     normalized_route_grade = "V8+"
         else:
             normalized_route_grade = route_grade
 
