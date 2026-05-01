@@ -1,4 +1,4 @@
-# Indoor Climbing Route Segmentation and Classification
+# Indoor Climbing Route Segmentation and Grade Classification
 
 ## Objective
 
