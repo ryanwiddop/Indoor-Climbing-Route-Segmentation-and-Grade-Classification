@@ -1,248 +1,170 @@
-import os, csv, json, sys
+"""
+Validate and normalize a CVAT COCO export.
+
+Input:  CVAT export (instances_default.json) - full-wall polygon annotations.
+Output: walls_clean.json - same schema with:
+  - 'occluded' attribute stripped
+  - route_id coerced to int where possible
+  - route_grade validated against VALID_GRADES (invalid values nulled out)
+  - per-route conflict reporting (same route_id with multiple grades on one image)
+  - grade distribution chart written to figures/grade_distribution.png
+
+Usage:
+    python ann_preprocessor.py <input.json> <output.json>
+"""
+
+import argparse
+import json
+import os
+from collections import defaultdict
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-path = sys.argv[1]
-out = sys.argv[2]
+VALID_GRADES = {
+    "VB", "V0", "V1", "V2", "V3", "V4", "V5", "V6",
+    "V7", "V8", "V9", "V10", "V11", "V12", "INC",
+}
+GRADE_ORDER = [
+    "VB", "V0", "V1", "V2", "V3", "V4", "V5", "V6",
+    "V7", "V8", "V9", "V10", "V11", "V12", "INC",
+]
 
 
-def parse_bool_like(value):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "1", "yes", "y"}:
-            return True
-        if normalized in {"false", "0", "no", "n", "null", "none", "nan", ""}:
-            return False
-    return None
+def parse_route_id(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
 
 
-def normalize_attr_value(value, field_name=None):
-    if field_name in {"incomplete_route", "is_volume"}:
-        if isinstance(value, dict):
-            if len(value) == 0:
-                return False
-            if len(value) == 1:
-                key, inner_value = next(iter(value.items()))
-                parsed_inner = parse_bool_like(inner_value)
-                if parsed_inner is not None:
-                    return parsed_inner
-                parsed_key = parse_bool_like(key)
-                if parsed_key is not None:
-                    return parsed_key
-            return None
-
-        parsed_bool = parse_bool_like(value)
-        if parsed_bool is not None:
-            return parsed_bool
-
-    if isinstance(value, dict):
-        if len(value) == 0:
-            return None
-        if len(value) == 1:
-            key, inner_value = next(iter(value.items()))
-            key = str(key).strip().lower()
-            if key in ("true", "false") and isinstance(inner_value, bool):
-                return inner_value
-            if isinstance(inner_value, (str, int, float, bool)) or inner_value is None:
-                return inner_value
-        return json.dumps(value, sort_keys=True)
-
-    if isinstance(value, str):
-        value = value.strip()
-        if value == "" or value.lower() in {"undefined", "null", "none", "nan"}:
-            return None
-        return value
-
-    return value
-
-hold_counts = 0
-route_counts = 0
-image_counts = 0
-grade_distribution = {}
-output_rows = []
+def parse_grade(value):
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s == "" or s.lower() in {"undefined", "null", "none", "nan"}:
+        return None
+    return s
 
 
-def update_grade_distribution_for_routes(routes, grade_distribution):
-    for route_id, route_attrs in routes.items():
-        if route_id is None or len(route_attrs) == 0:
-            continue
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("input")
+    ap.add_argument("output")
+    args = ap.parse_args()
 
-        chosen_attr, _ = max(
-            route_attrs.items(),
-            key=lambda item: (len(item[1]), str(item[0]))
-        )
-        chosen_grade = chosen_attr[0]
-        grade_distribution[chosen_grade] = grade_distribution.get(chosen_grade, 0) + 1
+    with open(args.input) as f:
+        coco = json.load(f)
 
+    cat_id_to_name = {c["id"]: c["name"] for c in coco["categories"]}
+    img_id_to_name = {im["id"]: im["file_name"] for im in coco["images"]}
 
-def report_route_conflicts(image_name, routes):
-    for route_id, route_attrs in routes.items():
-        if route_id is None:
-            continue
-        if len(route_attrs) == 0:
-            print(f"{image_name} - Route {route_id} has no attributes")
-        elif len(route_attrs) > 1:
-            print(f"{image_name} - Route {route_id} has conflicting attributes:")
-            print("  Grade\t| Inc.\t| Volume\t| Regions")
-            for attr, region_ids in sorted(route_attrs.items(), key=lambda item: str(item[0])):
-                print(f"    {attr[0]}\t| {attr[1]}\t| {attr[2]}\t| {[(int(rid) + 1) for rid in sorted(region_ids)]}")
+    hold_counts = 0
+    invalid_grades = []
+    cleaned_annotations = []
+    route_grades_by_image = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
-            majority_count = max(len(region_ids) for region_ids in route_attrs.values())
-            outliers = [
-                (attr, sorted(region_ids))
-                for attr, region_ids in route_attrs.items()
-                if len(region_ids) < majority_count
-            ]
-            if outliers:
-                print("  Outlier region_ids:")
-                for attr, region_ids in sorted(outliers, key=lambda item: str(item[0])):
-                    print(f"    {[int(rid) + 1 for rid in region_ids]} -> {attr}")
-
-# csv format: filename,file_size,file_attributes,region_count,region_id,region_shape_attributes,region_attributes
-# Ex: 00.jpg,8294565,"{}",187,0,"{""name"":""polygon"",""all_points_x"":[2406,2416,2421,2422,2415,2406,2395,2391,2389,2395,2402],""all_points_y"":[1670,1667,1659,1648,1639,1637,1640,1648,1658,1666,1671]}","{""route_id"":""1"",""route_grade"":""VB"",""incomplete_route"":""true"",""is_volume"":""false""}"
-
-with open(path, "r") as f:
-    reader = csv.DictReader(f)
-
-    current_image = None
-    image_route_ids = set()
-    routes = {}
-
-    for row in reader:
+    for ann in coco["annotations"]:
         hold_counts += 1
-        img_name = row["filename"]
+        img_id = ann["image_id"]
+        img_name = img_id_to_name.get(img_id, f"<id={img_id}>")
+        attr = ann.get("attributes", {})
 
-        if current_image is None:
-            current_image = img_name
-        elif img_name != current_image:
-            image_counts += 1
-            report_route_conflicts(current_image, routes)
-            update_grade_distribution_for_routes(routes, grade_distribution)
-            route_counts += len(image_route_ids)
-            image_route_ids = set()
-            routes = {}
-            current_image = img_name
+        route_id = parse_route_id(attr.get("route_id"))
+        grade = parse_grade(attr.get("route_grade"))
+        cat_name = cat_id_to_name.get(ann["category_id"], "unknown")
+        is_volume = cat_name == "volume"
 
-        region_id = row["region_id"]
-        count = int(row["region_count"])
-        size = int(row["file_size"])
-        shape = json.loads(row["region_shape_attributes"])
-        attr = json.loads(row["region_attributes"])
-        xs = shape.get("all_points_x", [])
-        ys = shape.get("all_points_y", [])
-        route_id = int(normalize_attr_value(attr.get("route_id", None), "route_id")) if normalize_attr_value(attr.get("route_id", None), "route_id") is not None else None
-        route_grade = normalize_attr_value(attr.get("route_grade", None), "route_grade")
-        # print(f"Processing {img_name}:{region_id} - route_id={route_id}, route_grade={route_grade}")
-        incomplete_route = normalize_attr_value(attr.get("incomplete_route", False), "incomplete_route")
-        is_volume = normalize_attr_value(attr.get("is_volume", False), "is_volume")
-        hold_type = normalize_attr_value(attr.get("hold_type", "hold"), "hold_type")
-        
-        if route_grade in ["INC", "A"]:
-            normalized_route_grade = None
-        # elif route_grade in ["VB", "V0"]:
-        #     normalized_route_grade = "V0-"
-        # elif route_grade in ["V8", "V9", "V10", "V11", "V12"]:
-        #     normalized_route_grade = "V8+"
-        else:
-            normalized_route_grade = route_grade
+        if grade is not None and grade not in VALID_GRADES:
+            invalid_grades.append((img_name, ann["id"], grade))
+            grade = None
 
-        if incomplete_route is True and normalized_route_grade is None:
-            normalized_route_grade = "INC"
+        if not is_volume:
+            if route_id is None:
+                print(f"{img_name}:{ann['id']} - Missing route_id (non-volume)")
+            if grade is None:
+                print(f"{img_name}:{ann['id']}\tID:{route_id} - Missing route_grade")
 
-        normalized_attr = {"route_id": route_id, "route_grade": normalized_route_grade, "incomplete_route": incomplete_route, "is_volume": is_volume, "hold_type": hold_type}
-        
-        if not xs or not ys or len(xs) != len(ys):
-            print(f"{img_name}:{int(region_id) + 1} - Unannotated image")
-            continue
-        
         if route_id is not None:
-            image_route_ids.add(route_id)
+            route_grades_by_image[img_id][route_id][grade].append(ann["id"])
 
-            if routes.get(route_id) is None:
-                routes[route_id] = {}
+        new_attr = {}
+        if route_id is not None:
+            new_attr["route_id"] = route_id
+        if grade is not None:
+            new_attr["route_grade"] = grade
 
-            route_attr_tuple = (normalized_route_grade, incomplete_route, is_volume, hold_type)
-            if route_attr_tuple not in routes[route_id]:
-                routes[route_id][route_attr_tuple] = []
-            routes[route_id][route_attr_tuple].append(region_id)
-        
-        if route_id is None and normalized_route_grade is None and incomplete_route is None and is_volume is None and hold_type is None:
-            print(f"{img_name}:{int(region_id) + 1} - Missing route attributes")
-        if route_id is None and is_volume is False:
-            print(f"{img_name}:{int(region_id) + 1} - Missing route_id")
-        if normalized_route_grade is None and is_volume is False and incomplete_route is False:
-            print(f"{img_name}:{int(region_id) + 1} - Missing route_grade")
-        if route_id is not None and normalized_route_grade is None and incomplete_route is False and is_volume is False:
-            print(f"{img_name}:{int(region_id) + 1} - Missing route_grade")
-        if incomplete_route is True and normalized_route_grade != "INC":
-            print(f"{img_name}:{int(region_id) + 1} - Incomplete route should not have a grade")
-            print(f"  Attributes: route_id={route_id}, route_grade={normalized_route_grade}, incomplete_route={incomplete_route}, is_volume={is_volume}")
-        if hold_type is None:
-            print(f"{img_name}:{int(region_id) + 1} - Missing hold_type")
-        if hold_type not in ["hold", "volume", "pinch", "jug", "sloper", "crimp", "edge", "pocket"]:
-            print(f"{img_name}:{int(region_id) + 1} - Unrecognized hold_type: {hold_type}")
+        new_ann = dict(ann)
+        new_ann["attributes"] = new_attr
+        cleaned_annotations.append(new_ann)
 
-        # csv format: filename,file_size,file_attributes,region_count,region_id,region_shape_attributes,region_attributes
-        # Ex: 00.jpg,8294565,"{}",187,0,"{""name"":""polygon"",""all_points_x"":[2406,2416,2421,2422,2415,2406,2395,2391,2389,2395,2402],""all_points_y"":[1670,1667,1659,1648,1639,1637,1640,1648,1658,1666,1671]}","{""route_id"":""1"",""route_grade"":""VB"",""incomplete_route"":""true"",""is_volume"":""false""}"
-        output_rows.append({
-            "filename": img_name,
-            "file_size": size,
-            "file_attributes": "{}",
-            "region_count": count,
-            "region_id": region_id,
-            "region_shape_attributes": json.dumps(shape, sort_keys=True),
-            "region_attributes": json.dumps(normalized_attr, sort_keys=True),
-        })
-        
-    report_route_conflicts(current_image, routes)
-    update_grade_distribution_for_routes(routes, grade_distribution)
+    for img_id, route_map in route_grades_by_image.items():
+        img_name = img_id_to_name[img_id]
+        for route_id, grade_to_ann_ids in route_map.items():
+            grades_clean = {g for g in grade_to_ann_ids.keys() if g is not None}
+            if len(grades_clean) > 1:
+                print(f"{img_name} - Route {route_id} has conflicting grades:")
+                for g in sorted(grades_clean):
+                    print(f"    {g}: ann_ids={sorted(grade_to_ann_ids[g])}")
+                majority = max(len(ids) for g, ids in grade_to_ann_ids.items() if g is not None)
+                outliers = [
+                    (g, ids) for g, ids in grade_to_ann_ids.items()
+                    if g is not None and len(ids) < majority
+                ]
+                if outliers:
+                    print("  Outliers:")
+                    for g, ids in sorted(outliers, key=lambda x: str(x[0])):
+                        print(f"    {sorted(ids)} -> {g}")
 
-    if current_image is not None:
-        route_counts += len(image_route_ids)
-        image_counts += 1
+    grade_distribution = defaultdict(int)
+    seen_routes = set()
+    for img_id, route_map in route_grades_by_image.items():
+        for route_id, grade_to_ann_ids in route_map.items():
+            grades_clean = {g for g in grade_to_ann_ids.keys() if g is not None}
+            if not grades_clean:
+                continue
+            chosen = max(grades_clean, key=lambda g: (len(grade_to_ann_ids[g]), g))
+            grade_distribution[chosen] += 1
+            seen_routes.add((img_id, route_id))
 
-with open(out, "w", newline="") as f:
-    fieldnames = [
-        "filename",
-        "file_size",
-        "file_attributes",
-        "region_count",
-        "region_id",
-        "region_shape_attributes",
-        "region_attributes",
-    ]
-    writer = csv.DictWriter(f, fieldnames=fieldnames)
-    writer.writeheader()
-    writer.writerows(output_rows)
-    print(f"Preprocessed annotations written to {out}")
+    if invalid_grades:
+        print(f"\n{len(invalid_grades)} annotations had invalid grades - set to None:")
+        for img_name, ann_id, grade in invalid_grades[:20]:
+            print(f"  {img_name}:{ann_id} - {grade!r}")
 
-print(f"Total holds: {hold_counts}")
-print(f"Total routes: {route_counts}")
-print(f"Total images: {image_counts}")
-print("Grade distribution:")
-for grade, count in sorted(grade_distribution.items(), key=lambda item: (item[0] is None, item[0])):
-    print(f"  {grade}: {count}")
-    
-# visualize grade distribution as a bar chart
-GRADE_ORDER = ["VB", "V0", "V0-", "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V8+", "V9", "V10", "V11", "V12", "INC"]
-ordered_grades = [g for g in GRADE_ORDER if g in grade_distribution]
-other_grades = [g for g in grade_distribution if g not in GRADE_ORDER]
-all_grades = ordered_grades + sorted(other_grades, key=lambda g: (g is None, str(g)))
-counts = [grade_distribution[g] for g in all_grades]
-labels = [str(g) if g is not None else "None" for g in all_grades]
+    cleaned = dict(coco)
+    cleaned["annotations"] = cleaned_annotations
+    with open(args.output, "w") as f:
+        json.dump(cleaned, f)
+    print(f"\nCleaned COCO written to {args.output}")
+    print(f"Total holds       : {hold_counts}")
+    print(f"Total routes      : {len(seen_routes)}")
+    print(f"Total images      : {len(coco['images'])}")
+    print("Grade distribution:")
+    for g in GRADE_ORDER:
+        if g in grade_distribution:
+            print(f"  {g}: {grade_distribution[g]}")
 
-fig, ax = plt.subplots(figsize=(12, 6))
-ax.bar(labels, counts)
-ax.set_xlabel("Grade")
-ax.set_ylabel("Route Count")
-ax.set_title("Grade Distribution")
-plt.tight_layout()
+    ordered = [g for g in GRADE_ORDER if g in grade_distribution]
+    counts = [grade_distribution[g] for g in ordered]
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(ordered, counts)
+    ax.set_xlabel("Grade")
+    ax.set_ylabel("Route Count")
+    ax.set_title("Grade Distribution")
+    plt.tight_layout()
+    figures_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
+    os.makedirs(figures_dir, exist_ok=True)
+    fig_path = os.path.join(figures_dir, "grade_distribution.png")
+    fig.savefig(fig_path)
+    print(f"Grade distribution chart saved to {fig_path}")
 
-figures_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
-os.makedirs(figures_dir, exist_ok=True)
-fig_path = os.path.join(figures_dir, "grade_distribution.png")
-fig.savefig(fig_path)
-print(f"Grade distribution chart saved to {fig_path}")
+
+if __name__ == "__main__":
+    main()
