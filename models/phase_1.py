@@ -34,7 +34,8 @@ except ImportError:
     from datasets.tiled_wall_dataset import TiledWallDataset, collate_fn
 
 TILED_IMG_PATH = "/home/public/rwiddop/tiled/tiles/"
-TILED_ANN_PATH = "/home/public/rwiddop/tiled/tiles.csv"
+TILED_TRAIN_ANN_PATH = "/home/public/rwiddop/tiled/tiles_train.csv"
+TILED_VAL_ANN_PATH = "/home/public/rwiddop/tiled/tiles_val.csv"
 LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "logs/phase_1.log")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints/phase_1.pt")
 FIGURES_PATH = os.path.join(os.path.dirname(__file__), "figures/phase_1/train")
@@ -279,22 +280,10 @@ def visualize_predictions(image_pil, gt_boxes, gt_labels, pred_boxes, pred_label
 
 def main():
     mp.set_start_method("spawn", force=True)
-    
-    hold_dataset = TiledWallDataset(TILED_IMG_PATH, TILED_ANN_PATH)
 
-    dataset_size = len(hold_dataset)
-    train_size = int(0.8 * dataset_size)
-    val_size = dataset_size - train_size
-
-    generator = torch.Generator().manual_seed(42)
-    indices = torch.randperm(dataset_size, generator=generator).tolist()
-    train_indices, val_indices = indices[:train_size], indices[train_size:]
-
-    train_base = TiledWallDataset(TILED_IMG_PATH, TILED_ANN_PATH, augment=True)
-    val_base   = TiledWallDataset(TILED_IMG_PATH, TILED_ANN_PATH, augment=False)
-    train_dataset = torch.utils.data.Subset(train_base, train_indices)
-    val_dataset   = torch.utils.data.Subset(val_base,   val_indices)
-    logger.info(f"Dataset size: {dataset_size}, Train size: {train_size}, Val size: {val_size}")
+    train_dataset = TiledWallDataset(TILED_IMG_PATH, TILED_TRAIN_ANN_PATH, augment=True)
+    val_dataset   = TiledWallDataset(TILED_IMG_PATH, TILED_VAL_ANN_PATH, augment=False)
+    logger.info(f"Dataset size: {len(train_dataset) + len(val_dataset)}, Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
 
     
     BATCH_SIZE = 16
@@ -318,11 +307,11 @@ def main():
         persistent_workers=True
     )
     
-    num_classes = len(hold_dataset.hold_type_to_idx) + 1
+    num_classes = len(train_dataset.hold_type_to_idx) + 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     logger.info(f"GPU compute capability: {torch.cuda.get_device_capability() if torch.cuda.is_available() else 'N/A'}")
-    logger.info(f"Grades: {hold_dataset.hold_type_to_idx}")
+    logger.info(f"Grades: {train_dataset.hold_type_to_idx}")
     
     model = build_model(num_classes).to(device)
     # model = torch.nn.DataParallel(model)
@@ -404,7 +393,7 @@ def main():
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": NUM_EPOCHS,
         "train_loss": avg_train_loss,
-        "hold_type_to_idx": hold_dataset.hold_type_to_idx,
+        "hold_type_to_idx": train_dataset.hold_type_to_idx,
         "num_classes": num_classes,
         "loss_history": loss_history
     }
@@ -497,7 +486,7 @@ def main():
         elif lbl == no_detection_label:
             tick_names.append("No Det")
         else:
-            tick_names.append(hold_dataset.idx_to_hold_type.get(lbl, str(lbl)))
+            tick_names.append(train_dataset.idx_to_hold_type.get(lbl, str(lbl)))
 
     plt.xticks(tick_marks, tick_names, rotation=45, ha="right")
     plt.yticks(tick_marks, tick_names)
@@ -553,7 +542,7 @@ def main():
                 image_pil,
                 gt_boxes, gt_labels,
                 pred_boxes, pred_labels, pred_scores,
-                hold_dataset.idx_to_hold_type,
+                train_dataset.idx_to_hold_type,
                 score_threshold=0.6,
                 output_name=f"{FIGURES_PATH}/prediction_{i+1}.png"
             )
