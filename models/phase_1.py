@@ -34,8 +34,8 @@ except ImportError:
     from datasets.tiled_wall_dataset import TiledWallDataset, collate_fn
 
 TILED_IMG_PATH = "/home/public/rwiddop/tiled/tiles/"
-TILED_TRAIN_ANN_PATH = "/home/public/rwiddop/tiled/tiles_train.csv"
-TILED_VAL_ANN_PATH = "/home/public/rwiddop/tiled/tiles_val.csv"
+TILED_TRAIN_ANN_PATH = "/home/public/rwiddop/tiled/tiles_train.json"
+TILED_VAL_ANN_PATH = "/home/public/rwiddop/tiled/tiles_val.json"
 LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "logs/phase_1.log")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints/phase_1.pt")
 FIGURES_PATH = os.path.join(os.path.dirname(__file__), "figures/phase_1/train")
