@@ -66,6 +66,7 @@ def main():
     img_id_to_name = {im["id"]: im["file_name"] for im in coco["images"]}
 
     hold_counts = 0
+    hold_type_counts = defaultdict(int)
     invalid_grades = []
     cleaned_annotations = []
     route_grades_by_image = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -80,6 +81,7 @@ def main():
         grade = parse_grade(attr.get("route_grade"))
         cat_name = cat_id_to_name.get(ann["category_id"], "unknown")
         is_volume = cat_name == "volume"
+        hold_type_counts[cat_name] += 1
 
         if grade is not None and grade not in VALID_GRADES:
             invalid_grades.append((img_name, ann["id"], grade))
@@ -150,6 +152,9 @@ def main():
     for g in GRADE_ORDER:
         if g in grade_distribution:
             print(f"  {g}: {grade_distribution[g]}")
+    print("Hold type distribution:")
+    for t in sorted(hold_type_counts.keys()):
+        print(f"  {t}: {hold_type_counts[t]}")
 
     ordered = [g for g in GRADE_ORDER if g in grade_distribution]
     counts = [grade_distribution[g] for g in ordered]
@@ -164,7 +169,19 @@ def main():
     fig_path = os.path.join(figures_dir, "grade_distribution.png")
     fig.savefig(fig_path)
     print(f"Grade distribution chart saved to {fig_path}")
-
+    
+    hold_types = sorted(hold_type_counts.keys())
+    hold_counts_list = [hold_type_counts[t] for t in hold_types]
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(hold_types, hold_counts_list)
+    ax.set_xlabel("Hold Type")
+    ax.set_ylabel("Hold Count")
+    ax.set_title("Hold Type Distribution")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    hold_fig_path = os.path.join(figures_dir, "hold_type_distribution.png")
+    fig.savefig(hold_fig_path)
+    print(f"Hold type distribution chart saved to {hold_fig_path}")
 
 if __name__ == "__main__":
     main()
