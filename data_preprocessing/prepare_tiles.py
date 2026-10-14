@@ -118,8 +118,8 @@ def parse_args():
     p.add_argument("img_dir")
     p.add_argument("coco_json")
     p.add_argument("out_dir")
-    p.add_argument("--tile-size", type=int, default=800)
-    p.add_argument("--overlap", type=float, default=0.25)
+    p.add_argument("--tile-size", type=int, default=1600)
+    p.add_argument("--overlap", type=float, default=0.66)
     p.add_argument("--min-overlap-frac", type=float, default=0.35,
                    help="Min fraction of hold bbox that must overlap tile")
     p.add_argument("--vis-per-image", type=int, default=3,
@@ -171,20 +171,10 @@ def main():
         "annotations": [],
     }
 
-    stats = {"tiles": 0, "pos": 0, "neg": 0, "holds": 0, "skipped": 0}
+    stats = {"tiles": 0, "pos": 0, "neg": 0, "holds": 0, "skipped": 0, "unannotated": 0}
 
     for wall in coco["images"]:
         img_name = wall["file_name"]
-        img_path = os.path.join(args.img_dir, img_name)
-        if not os.path.isfile(img_path):
-            print(f"Warning: {img_path} not found. Skipping.")
-            stats["skipped"] += 1
-            continue
-
-        image = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
-        W, H = image.size
-        img_stem = os.path.splitext(img_name)[0]
-        target = train_coco if img_name in train_walls else val_coco
 
         holds = []
         for ann in anns_by_image[wall["id"]]:
@@ -199,6 +189,22 @@ def main():
                 "category_id": ann["category_id"],
                 "attributes": ann.get("attributes", {}),
             })
+
+        if not holds:
+            print(f"   {img_name}: 0 annotated holds. Skipping.")
+            stats["unannotated"] += 1
+            continue
+
+        img_path = os.path.join(args.img_dir, img_name)
+        if not os.path.isfile(img_path):
+            print(f"Warning: {img_path} not found. Skipping.")
+            stats["skipped"] += 1
+            continue
+
+        image = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
+        W, H = image.size
+        img_stem = os.path.splitext(img_name)[0]
+        target = train_coco if img_name in train_walls else val_coco
 
         tile_records = []
         for (tx0, ty0, tx1, ty1) in iter_tiles(H, W, args.tile_size, args.overlap):
@@ -283,7 +289,7 @@ def main():
     if stats["pos"] > 0:
         print(f"  Neg:Pos ratio     : {stats['neg'] / stats['pos']:.2f}")
         print(f"Hold instances      : {stats['holds']}  ({stats['holds'] / stats['pos']:.1f} per pos tile)")
-    print(f"Images skipped      : {stats['skipped']}")
+    print(f"Images skipped      : {stats['skipped']} missing, {stats['unannotated']} unannotated")
     print(f"Train COCO          : {train_path}  ({len(train_coco['images'])} tiles, {len(train_coco['annotations'])} anns)")
     print(f"Val COCO            : {val_path}  ({len(val_coco['images'])} tiles, {len(val_coco['annotations'])} anns)")
     print(f"Tiles dir           : {tiles_dir}")
