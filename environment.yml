@@ -1,6 +1,7 @@
 name: ML
 channels:
   - defaults
+  - conda-forge
 dependencies:
   - _libgcc_mutex=0.1=main
   - _openmp_mutex=5.1=1_gnu
@@ -20,7 +21,7 @@ dependencies:
   - blinker=1.9.0=py314h06a4308_1
   - bzip2=1.0.8=h5eee18b_6
   - c-ares=1.34.6=hd44998d_0
-  - ca-certificates=2026.3.19=h06a4308_0
+  - ca-certificates=2026.9.25=h06a4308_0
   - cairo=1.18.4=h44eff21_0
   - click=8.2.1=py314h06a4308_1
   - contourpy=1.3.3=py314hdb19cb5_0
@@ -40,6 +41,7 @@ dependencies:
   - cyrus-sasl=2.1.28=h83b0a09_4
   - dav1d=1.2.1=h5eee18b_0
   - dbus=1.16.2=h5bd4931_0
+  - defusedxml=0.7.1=pyhd3eb1b0_0
   - expat=2.7.5=h7354ed3_0
   - ffmpeg=8.0.1=h55ac625_2
   - fftw=3.3.10=hbd630f4_0
@@ -187,13 +189,14 @@ dependencies:
   - nccl=2.29.3.1=ha9c37b5_0
   - ncurses=6.5=h7934f7d_0
   - networkx=3.6.1=py314h06a4308_0
+  - nltk=3.10.3=py314h6fa48dc_0
   - numpy=2.4.4=py314hc4ca38b_1
   - numpy-base=2.4.4=py314h7c74580_1
   - opencv=4.13.0=qt611_py314ha46ff05_106
   - openh264=2.6.0=ha05cbb4_1
   - openjpeg=2.5.4=h4e0627c_1
   - openldap=2.6.12=hb446bd0_0
-  - openssl=3.5.6=h1b28b03_0
+  - openssl=3.5.9=h1b28b03_0
   - optree=0.18.0=py314h24d9097_0
   - packaging=26.0=py314h06a4308_0
   - pandas=3.0.2=py314h973aee8_0
@@ -208,6 +211,7 @@ dependencies:
   - pulseaudio-daemon=17.0=h1a6afb5_0
   - py-spy=0.4.1=he930205_0
   - pybind11-abi=5=hd3eb1b0_0
+  - pycocotools=2.0.11=py314hc02f841_0
   - pyparsing=3.2.5=py314h06a4308_0
   - pyqt=6.11.0=py314h0eb9b55_0
   - pyqt6-sip=13.11.1=py314h47b2149_0
@@ -224,6 +228,7 @@ dependencies:
   - qtwebsockets=6.11.0=h8bda742_0
   - rdma-core=61.0=h7354ed3_0
   - readline=8.3=hc2a1206_0
+  - regex=2026.7.19=py314h47b2149_0
   - s2n=1.6.2=h02aa81b_0
   - scikit-learn=1.8.0=py314h973aee8_0
   - scipy=1.17.1=py314h3d0cd3c_1
