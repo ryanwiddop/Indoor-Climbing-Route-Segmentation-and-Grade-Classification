@@ -3,10 +3,14 @@ Validate and normalize a CVAT COCO export.
 
 Input:  CVAT export (instances_default.json) - full-wall polygon annotations.
 Output: walls_clean.json - same schema with:
+  - images carrying zero annotations dropped
+  - categories carrying zero annotations dropped (CVAT exports unused labels,
+    and an unused label still becomes a model class head downstream)
   - 'occluded' attribute stripped
   - route_id coerced to int where possible
   - route_grade validated against VALID_GRADES (invalid values nulled out)
   - per-route conflict reporting (same route_id with multiple grades on one image)
+  - untyped holds flagged (category 'hold' rather than jug/crimp/foot/...)
   - grade distribution chart written to figures/grade_distribution.png
 
 Usage:
@@ -23,13 +27,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 VALID_GRADES = {
-    "VB", "V0", "V1", "V2", "V3", "V4", "V5", "V6",
-    "V7", "V8", "V9", "V10", "V11", "V12", "INC",
+    "VB", "V0", "V0-", "V1", "V1-", "V2", "V3", "V4", "V5", "V6",
+    "V7", "V8", "V9", "V10", "V11", "V12", "V8+", "V9+", "INC",
 }
+
 GRADE_ORDER = [
-    "VB", "V0", "V1", "V2", "V3", "V4", "V5", "V6",
-    "V7", "V8", "V9", "V10", "V11", "V12", "INC",
+    "VB", "V0", "V0-", "V1", "V1-", "V2", "V3", "V4", "V5", "V6",
+    "V7", "V8", "V9", "V10", "V11", "V12", "V8+", "V9+", "INC",
 ]
+
+UNTYPED_CATEGORY = "hold"
+VOLUME_CATEGORY = "volume"
+HOLD_TYPES = {"jug", "crimp", "pocket", "sloper", "pinch", "edge", "foot"}
 
 
 def parse_route_id(value):
@@ -66,8 +75,11 @@ def main():
     img_id_to_name = {im["id"]: im["file_name"] for im in coco["images"]}
 
     hold_counts = 0
+    non_volume_counts = 0
     hold_type_counts = defaultdict(int)
     invalid_grades = []
+    untyped_holds = []
+    unknown_categories = []
     cleaned_annotations = []
     route_grades_by_image = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
@@ -80,18 +92,32 @@ def main():
         route_id = parse_route_id(attr.get("route_id"))
         grade = parse_grade(attr.get("route_grade"))
         cat_name = cat_id_to_name.get(ann["category_id"], "unknown")
-        is_volume = cat_name == "volume"
+        is_volume = cat_name == VOLUME_CATEGORY
         hold_type_counts[cat_name] += 1
 
         if grade is not None and grade not in VALID_GRADES:
             invalid_grades.append((img_name, ann["id"], grade))
             grade = None
+            
+        # if grade == "VB" or grade == "V0" or grade == "V1":
+        #     grade = "V1-"
+        if grade == "VB" or grade == "V0":
+            grade = "V0-"
+        elif grade == "V8" or grade == "V9" or grade == "V10" or grade == "V11" or grade == "V12":
+            grade = "V8+"
 
         if not is_volume:
+            non_volume_counts += 1
             if route_id is None:
                 print(f"{img_name}:{ann['id']} - Missing route_id (non-volume)")
             if grade is None:
                 print(f"{img_name}:{ann['id']}\tID:{route_id} - Missing route_grade")
+            if cat_name == UNTYPED_CATEGORY:
+                untyped_holds.append((img_name, ann["id"]))
+                print(f"{img_name}:{ann['id']}\tID:{route_id} - Missing hold type")
+            elif cat_name not in HOLD_TYPES:
+                unknown_categories.append((img_name, ann["id"], cat_name))
+                print(f"{img_name}:{ann['id']}\tID:{route_id} - Unknown category {cat_name!r}")
 
         if route_id is not None:
             route_grades_by_image[img_id][route_id][grade].append(ann["id"])
@@ -140,14 +166,37 @@ def main():
         for img_name, ann_id, grade in invalid_grades[:20]:
             print(f"  {img_name}:{ann_id} - {grade!r}")
 
+    annotated_img_ids = {ann["image_id"] for ann in cleaned_annotations}
+    kept_images = [im for im in coco["images"] if im["id"] in annotated_img_ids]
+    dropped_images = [im["file_name"] for im in coco["images"] if im["id"] not in annotated_img_ids]
+    if dropped_images:
+        print(f"\n{len(dropped_images)} images had zero annotations - dropped:")
+        for name in sorted(dropped_images):
+            print(f"  {name}")
+
+    used_cat_ids = {ann["category_id"] for ann in cleaned_annotations}
+    kept_categories = [c for c in coco["categories"] if c["id"] in used_cat_ids]
+    dropped_categories = [c["name"] for c in coco["categories"] if c["id"] not in used_cat_ids]
+    if dropped_categories:
+        print(f"\n{len(dropped_categories)} categories had zero annotations - dropped:")
+        for name in dropped_categories:
+            print(f"  {name}")
+
     cleaned = dict(coco)
+    cleaned["images"] = kept_images
+    cleaned["categories"] = kept_categories
     cleaned["annotations"] = cleaned_annotations
     with open(args.output, "w") as f:
         json.dump(cleaned, f)
     print(f"\nCleaned COCO written to {args.output}")
     print(f"Total holds       : {hold_counts}")
+    if non_volume_counts:
+        pct = 100.0 * len(untyped_holds) / non_volume_counts
+        print(f"Untyped holds     : {len(untyped_holds)} / {non_volume_counts} non-volume ({pct:.1f}%)")
+    if unknown_categories:
+        print(f"Unknown categories: {len(unknown_categories)}")
     print(f"Total routes      : {len(seen_routes)}")
-    print(f"Total images      : {len(coco['images'])}")
+    print(f"Total images      : {len(kept_images)} (dropped {len(dropped_images)} unannotated)")
     print("Grade distribution:")
     for g in GRADE_ORDER:
         if g in grade_distribution:
