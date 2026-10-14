@@ -18,7 +18,10 @@ from sklearn.metrics import classification_report, confusion_matrix
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import GradScaler, autocast
+import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import torchvision
 import torchvision.transforms as T
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
@@ -80,6 +83,19 @@ def log_script_start():
     )
     
 
+def setup_distributed():
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return 0, 1, 0, device, False
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://")
+    return rank, world_size, local_rank, torch.device("cuda", local_rank), True
+
+
 def parse_json(s):
     try:
         return json.loads(s)
@@ -87,11 +103,18 @@ def parse_json(s):
         return {}
     
 
-def build_model(num_classes):
+TRAIN_MIN_SIZES = (1000, 1200, 1400, 1600)
+TRAIN_MAX_SIZE = 1600
+
+
+def build_model(num_classes, min_size=TRAIN_MIN_SIZES, max_size=TRAIN_MAX_SIZE):
+    sizes = (min_size,) if isinstance(min_size, int) else tuple(min_size)
+    assert max(sizes) <= max_size, f"max_size={max_size} clamps min_size={sizes}"
+
     model = torchvision.models.detection.maskrcnn_resnet50_fpn_v2(
         weights="DEFAULT",
-        min_size=240,
-        max_size=800,
+        min_size=sizes,
+        max_size=max_size,
     )
     
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -102,6 +125,98 @@ def build_model(num_classes):
     model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, hidden_layer, num_classes)
     
     return model
+
+
+def validate_loss(model, loader, device):
+    was_training = model.training
+    model.train()
+    for module in model.modules():
+        if isinstance(module, torch.nn.BatchNorm2d):
+            module.eval()
+
+    total, count = 0.0, 0
+    with torch.no_grad():
+        for images, targets in loader:
+            if not images or not targets:
+                continue
+            images = [image.to(device) for image in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            with autocast(device_type=device.type, dtype=torch.float16,
+                          enabled=device.type == "cuda"):
+                loss_dict = model(images, targets)
+            total += float(sum(loss_dict.values()))
+            count += 1
+
+    model.train(was_training)
+    return total / max(count, 1)
+
+
+def _ap_from_flags(sorted_tp, num_gt):
+    if num_gt == 0:
+        return float("nan")
+    if sorted_tp.size == 0:
+        return 0.0
+    tp = np.cumsum(sorted_tp)
+    fp = np.cumsum(1.0 - sorted_tp)
+    recall = tp / num_gt
+    precision = tp / np.maximum(tp + fp, 1e-12)
+    mrec = np.concatenate(([0.0], recall, [1.0]))
+    mpre = np.concatenate(([0.0], precision, [0.0]))
+    for i in range(len(mpre) - 1, 0, -1):
+        mpre[i - 1] = max(mpre[i - 1], mpre[i])
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
+
+
+def validate_map(model, loader, device, num_classes, iou_thresh=0.5):
+    """Class-aware mAP@iou_thresh over the loader. Selection metric for checkpoints:
+    val *loss* bottoms out within a few epochs and then rises while mAP keeps
+    improving, so loss is not a usable early-stopping signal for detection."""
+    was_training = model.training
+    model.eval()
+    acc = {c: {"scores": [], "tp": [], "n_gt": 0} for c in range(1, num_classes)}
+
+    with torch.no_grad():
+        for images, targets in loader:
+            if not images or not targets:
+                continue
+            outputs = model([image.to(device) for image in images])
+            for target, output in zip(targets, outputs):
+                gt_boxes = target["boxes"].cpu().numpy()
+                gt_labels = target["labels"].cpu().numpy()
+                pb = output["boxes"].cpu().numpy()
+                pl = output["labels"].cpu().numpy()
+                ps = output["scores"].cpu().numpy()
+                for c, a in acc.items():
+                    g = gt_boxes[gt_labels == c]
+                    a["n_gt"] += len(g)
+                    m = pl == c
+                    if not m.any():
+                        continue
+                    cb, cs = pb[m], ps[m]
+                    taken = np.zeros(len(g), dtype=bool)
+                    for i in np.argsort(-cs):
+                        a["scores"].append(float(cs[i]))
+                        if len(g) == 0:
+                            a["tp"].append(0.0)
+                            continue
+                        ious = _iou_vec(cb[i], g)
+                        ious[taken] = -1.0
+                        j = int(np.argmax(ious))
+                        hit = ious[j] >= iou_thresh
+                        taken[j] |= hit
+                        a["tp"].append(1.0 if hit else 0.0)
+
+    aps = []
+    for a in acc.values():
+        if a["n_gt"] == 0:
+            continue
+        scores = np.asarray(a["scores"], dtype=np.float64)
+        flags = np.asarray(a["tp"], dtype=np.float64)
+        aps.append(_ap_from_flags(flags[np.argsort(-scores)], a["n_gt"]))
+
+    model.train(was_training)
+    return float(np.mean(aps)) if aps else 0.0
 
 
 def box_iou(boxA, boxB):
@@ -131,7 +246,11 @@ def load_model(checkpoint_path, device, max_detections=500):
     hold_type_to_idx = ckpt["hold_type_to_idx"]
     num_classes = ckpt["num_classes"]
 
-    model = build_model(num_classes)
+    model = build_model(
+        num_classes,
+        min_size=ckpt.get("min_size", 1600),
+        max_size=ckpt.get("max_size", 1600),
+    )
     state = ckpt["model_state_dict"]
     if any(k.startswith("module.") for k in state.keys()):
         state = {k[len("module."):]: v for k, v in state.items()}
@@ -159,32 +278,16 @@ def _iter_tiles(H, W, tile, overlap):
             yield y0, y1, x0, x1
 
 
-def _nms_numpy(boxes, scores, iou_threshold):
-    if len(boxes) == 0:
-        return np.array([], dtype=np.int64)
-    order = np.argsort(-scores).tolist()
-    keep = []
-    while order:
-        i = order.pop(0)
-        keep.append(i)
-        if not order:
-            break
-        bi = boxes[i]
-        rest = boxes[order]
-        x1 = np.maximum(bi[0], rest[:, 0])
-        y1 = np.maximum(bi[1], rest[:, 1])
-        x2 = np.minimum(bi[2], rest[:, 2])
-        y2 = np.minimum(bi[3], rest[:, 3])
-        iw = np.clip(x2 - x1, 0, None)
-        ih = np.clip(y2 - y1, 0, None)
-        inter = iw * ih
-        a_i = max(0, bi[2] - bi[0]) * max(0, bi[3] - bi[1])
-        a_r = np.clip(rest[:, 2] - rest[:, 0], 0, None) * \
-              np.clip(rest[:, 3] - rest[:, 1], 0, None)
-        union = a_i + a_r - inter
-        ious = np.where(union > 0, inter / union, 0.0)
-        order = [order[k] for k in range(len(order)) if ious[k] < iou_threshold]
-    return np.asarray(keep, dtype=np.int64)
+def _iou_vec(box, others):
+    """IoU of `box` against each row of `others`."""
+    x1 = np.maximum(box[0], others[:, 0]); y1 = np.maximum(box[1], others[:, 1])
+    x2 = np.minimum(box[2], others[:, 2]); y2 = np.minimum(box[3], others[:, 3])
+    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    a = max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+    b = np.clip(others[:, 2] - others[:, 0], 0, None) * \
+        np.clip(others[:, 3] - others[:, 1], 0, None)
+    union = a + b - inter
+    return np.where(union > 0, inter / union, 0.0)
 
 
 def _crop_mask_to_bbox(mask, box, img_h, img_w):
@@ -197,9 +300,50 @@ def _crop_mask_to_bbox(mask, box, img_h, img_w):
     return x1, y1, mask[y1:y2, x1:x2].copy()
 
 
-def tiled_predict(model, image_tensor_cpu, device, tile_size=800, overlap=0.25, score_threshold=0.05, nms_iou=0.5):
+def _ios_vec(box, others):
+    """Intersection over smaller area: high when one box is *contained* in the other."""
+    x1 = np.maximum(box[0], others[:, 0]); y1 = np.maximum(box[1], others[:, 1])
+    x2 = np.minimum(box[2], others[:, 2]); y2 = np.minimum(box[3], others[:, 3])
+    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    a = max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+    b = np.clip(others[:, 2] - others[:, 0], 0, None) * np.clip(others[:, 3] - others[:, 1], 0, None)
+    m = np.minimum(a, b)
+    return np.where(m > 0, inter / m, 0.0)
+
+
+def _merge_tiles(boxes, scores, labels, seam, iou_thresh=0.5, ios_thresh=0.8, volume_label=None):
+    """Merge per-tile detections into wall-level ones.
+
+    Two halves of one hold seen from adjacent tiles overlap at IoU ~0.38 (max
+    0.498 measured on this dataset), which sits under any usable NMS gate, so
+    plain IoU-NMS keeps both and the hold comes out sliced along the tile edge.
+    A seam fragment is however almost exactly *contained* in the intact
+    detection from the neighbouring tile (IoS ~1.0), so containment is the
+    criterion that separates a fragment from a genuinely distinct hold.
+    """
+    order = sorted(range(len(boxes)), key=lambda i: (bool(seam[i]), -scores[i]))
+    keep = []
+    while order:
+        i = order.pop(0)
+        keep.append(i)
+        if not order:
+            break
+        rest = np.asarray(order, dtype=np.int64)
+        drop = _iou_vec(boxes[i], boxes[rest]) >= iou_thresh          # ordinary duplicate
+        frag = seam[rest] & (_ios_vec(boxes[i], boxes[rest]) >= ios_thresh)
+        # Holds are bolted onto volumes and so sit legitimately inside a volume's
+        # box; never let a volume swallow a hold it merely contains.
+        if volume_label is not None and int(labels[i]) == volume_label:
+            frag &= labels[rest] == volume_label
+        order = [int(j) for j in rest[~(drop | frag)]]
+    return np.asarray(keep, dtype=np.int64)
+
+
+def tiled_predict(model, image_tensor_cpu, device, tile_size=1600, overlap=0.66,
+    score_threshold=0.05, nms_iou=0.5, ios_thresh=0.8, seam_margin=2, volume_label=None):
+
     C, H, W = image_tensor_cpu.shape
-    all_boxes, all_scores, all_labels, all_masks = [], [], [], []
+    all_boxes, all_scores, all_labels, all_masks, all_seam = [], [], [], [], []
 
     for (y0, y1, x0, x1) in _iter_tiles(H, W, tile_size, overlap):
         tile = image_tensor_cpu[:, y0:y1, x0:x1].to(device)
@@ -224,10 +368,19 @@ def tiled_predict(model, image_tensor_cpu, device, tile_size=800, overlap=0.25, 
         for b, s, l, m in zip(pb, ps, pl, pm):
             lx, ly, local = _crop_mask_to_bbox(m, b, tile_h, tile_w)
             wall_box = np.array([b[0] + x0, b[1] + y0, b[2] + x0, b[3] + y0], dtype=np.float32)
+            # A detection running into a tile edge that is not also the wall edge
+            # is a candidate fragment: the hold continues into the next tile.
+            seam = bool(
+                (b[0] <= seam_margin and x0 > 0)
+                or (b[1] <= seam_margin and y0 > 0)
+                or (b[2] >= tile_w - seam_margin and x1 < W)
+                or (b[3] >= tile_h - seam_margin and y1 < H)
+            )
             all_boxes.append(wall_box)
             all_scores.append(float(s))
             all_labels.append(int(l))
             all_masks.append((lx + x0, ly + y0, local))
+            all_seam.append(seam)
 
     if not all_boxes:
         return {
@@ -240,8 +393,12 @@ def tiled_predict(model, image_tensor_cpu, device, tile_size=800, overlap=0.25, 
     all_boxes  = np.stack(all_boxes, axis=0)
     all_scores = np.asarray(all_scores, dtype=np.float32)
     all_labels = np.asarray(all_labels, dtype=np.int64)
+    all_seam   = np.asarray(all_seam,   dtype=bool)
 
-    keep_idx = _nms_numpy(all_boxes, all_scores, nms_iou)
+    keep_idx = _merge_tiles(
+        all_boxes, all_scores, all_labels, all_seam,
+        iou_thresh=nms_iou, ios_thresh=ios_thresh, volume_label=volume_label,
+    )
 
     return {
         "boxes":  all_boxes[keep_idx],
@@ -281,6 +438,12 @@ def visualize_predictions(image_pil, gt_boxes, gt_labels, pred_boxes, pred_label
 def main():
     mp.set_start_method("spawn", force=True)
 
+    rank, world_size, local_rank, device, distributed = setup_distributed()
+    is_main = rank == 0
+    if not is_main:
+        logger.setLevel(logging.WARNING)
+        logging.getLogger("datasets.tiled_wall_dataset").setLevel(logging.WARNING)
+
     train_dataset = TiledWallDataset(TILED_IMG_PATH, TILED_TRAIN_ANN_PATH, augment=True)
     val_dataset   = TiledWallDataset(TILED_IMG_PATH, TILED_VAL_ANN_PATH, augment=False)
     logger.info(f"Dataset size: {len(train_dataset) + len(val_dataset)}, Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
@@ -290,10 +453,15 @@ def main():
     NUM_WORKERS = 8
     NUM_EPOCHS = 45
 
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
+    ) if distributed else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=NUM_WORKERS,
         collate_fn=collate_fn,
         persistent_workers=True
@@ -308,14 +476,16 @@ def main():
     )
     
     num_classes = len(train_dataset.hold_type_to_idx) + 1
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-    logger.info(f"GPU compute capability: {torch.cuda.get_device_capability() if torch.cuda.is_available() else 'N/A'}")
+    logger.info(f"Using device: {device} | rank {rank}/{world_size} | distributed={distributed}")
+    logger.info(f"GPU compute capability: {torch.cuda.get_device_capability(device) if torch.cuda.is_available() else 'N/A'}")
+    logger.info(f"Effective batch size: {BATCH_SIZE * world_size} ({BATCH_SIZE} per rank)")
     logger.info(f"Grades: {train_dataset.hold_type_to_idx}")
     
     model = build_model(num_classes).to(device)
-    # model = torch.nn.DataParallel(model)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-5)
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    core_model = model.module if distributed else model
+    optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4, weight_decay=1e-5)
     
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=[30, 40], gamma=0.1
@@ -326,12 +496,19 @@ def main():
     
     best_train_loss = float("inf")
     best_loss_epoch = -1
+    best_val_loss = float("inf")
+    best_val_map = -1.0
+    best_val_epoch = -1
     
     start_time = time.perf_counter()
     last_epoch_time = start_time
     
     loss_history = []
+    val_loss_history = []
+    val_map_history = []
     for epoch in range(NUM_EPOCHS):
+        if distributed:
+            train_sampler.set_epoch(epoch)
         model.train()
         train_loss = 0.0
         running_count = 0
@@ -342,7 +519,8 @@ def main():
                 desc=f"Epoch {epoch+1}/{NUM_EPOCHS}",
                 unit="batch",
                 leave=True,
-                dynamic_ncols=True
+                dynamic_ncols=True,
+                disable=not is_main
             )
             for images, targets in pbar:
                 t_batch_got = time.perf_counter()
@@ -373,34 +551,68 @@ def main():
             
             lr_scheduler.step()
             
+            if distributed:
+                stats = torch.tensor([train_loss, running_count], dtype=torch.float64, device=device)
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                train_loss, running_count = stats[0].item(), int(stats[1].item())
+            
             avg_train_loss = train_loss / max(running_count, 1)
             if avg_train_loss < best_train_loss:
                 best_train_loss = avg_train_loss
                 best_loss_epoch = epoch + 1
                 
             loss_history.append(avg_train_loss)
-            
-            epoch_time = time.perf_counter() - last_epoch_time
-            # logger.info(f"Epoch {epoch+1}/{NUM_EPOCHS} - Train Loss: {avg_train_loss:.4f} - Epoch Time: {epoch_time:.2f} seconds")
+
+            if is_main:
+                avg_val_loss = validate_loss(core_model, val_loader, device)
+                val_map = validate_map(core_model, val_loader, device, num_classes)
+                val_loss_history.append(avg_val_loss)
+                val_map_history.append(val_map)
+                best_val_loss = min(best_val_loss, avg_val_loss)
+                improved = val_map > best_val_map
+                if improved:
+                    best_val_map = val_map
+                    best_val_epoch = epoch + 1
+                    torch.save({
+                        "model_state_dict": core_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "epoch": epoch + 1,
+                        "train_loss": avg_train_loss,
+                        "val_loss": avg_val_loss,
+                        "val_map": val_map,
+                        "hold_type_to_idx": train_dataset.hold_type_to_idx,
+                        "num_classes": num_classes,
+                        "min_size": TRAIN_MIN_SIZES,
+                        "max_size": TRAIN_MAX_SIZE,
+                        "loss_history": loss_history,
+                        "val_loss_history": val_loss_history,
+                        "val_map_history": val_map_history,
+                    }, CHECKPOINT_PATH)
+                logger.info(
+                    "Epoch %d/%d - train %.4f - val %.4f - mAP@.5 %.4f%s - %.1fs",
+                    epoch + 1, NUM_EPOCHS, avg_train_loss, avg_val_loss, val_map,
+                    "  *best*" if improved else "",
+                    time.perf_counter() - last_epoch_time,
+                )
+
             last_epoch_time = time.perf_counter()
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
     logger.info(f"Training completed in {elapsed_time:.2f} seconds")
     logger.info(f"Best Train Loss: {best_train_loss:.4f} at epoch {best_loss_epoch}")
+    logger.info(f"Best Val mAP@.5: {best_val_map:.4f} at epoch {best_val_epoch} of {NUM_EPOCHS} (best val loss seen: {best_val_loss:.4f})")
     
-    checkpoint = {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "epoch": NUM_EPOCHS,
-        "train_loss": avg_train_loss,
-        "hold_type_to_idx": train_dataset.hold_type_to_idx,
-        "num_classes": num_classes,
-        "loss_history": loss_history
-    }
-    torch.save(checkpoint, CHECKPOINT_PATH)
-    logger.info(f"Model checkpoint saved to {CHECKPOINT_PATH}")
+    if distributed:
+        dist.barrier()
+        if not is_main:
+            dist.destroy_process_group()
+            return
     
-    model.eval()
+    ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
+    core_model.load_state_dict(ckpt["model_state_dict"])
+    logger.info(f"Evaluating best checkpoint (epoch {ckpt['epoch']}, val_mAP@.5={ckpt['val_map']:.4f}, val_loss={ckpt['val_loss']:.4f}) from {CHECKPOINT_PATH}")
+    
+    core_model.eval()
     iou_threshold = 0.5
     no_detection_label = num_classes
 
@@ -410,7 +622,7 @@ def main():
         for images, targets in val_loader:
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-            outputs = model(images)
+            outputs = core_model(images)
             for target, output in zip(targets, outputs):
                 all_raw.append((
                     target["boxes"].cpu().numpy(),
@@ -508,25 +720,34 @@ def main():
     
     # visualize loss curve
     plt.figure(figsize=(10, 6))
-    plt.plot(range(1, NUM_EPOCHS + 1), loss_history, marker="o")
-    plt.title("Training Loss Curve (Avg.)")
-    plt.xlabel("Epoch")
-    plt.ylabel("Total Loss")
-    plt.xticks(range(1, NUM_EPOCHS + 1, max(1, NUM_EPOCHS // 15)))
-    plt.grid()
+    ax = plt.gca()
+    ax.plot(range(1, len(loss_history) + 1), loss_history, marker="o", label="train loss")
+    ax.plot(range(1, len(val_loss_history) + 1), val_loss_history, marker="s", label="val loss")
+    ax.axvline(best_val_epoch, color="green", linestyle="--", label=f"saved (epoch {best_val_epoch})")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Total Loss")
+    ax.set_xticks(range(1, NUM_EPOCHS + 1, max(1, NUM_EPOCHS // 15)))
+    ax.grid()
+    ax2 = ax.twinx()
+    ax2.plot(range(1, len(val_map_history) + 1), val_map_history, marker="^", color="tab:red", label="val mAP@.5")
+    ax2.set_ylabel("val mAP@.5")
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, loc="center right")
+    plt.title("Loss Curves and Val mAP")
     plt.tight_layout()
     plt.savefig(FIGURES_PATH + "/phase_1_loss_curve.png", dpi=200, bbox_inches="tight")
     plt.close()
     logger.info(f"Saved loss curve to {FIGURES_PATH}/phase_1_loss_curve.png")
     
     # visualize some predictions
-    model.eval()
+    core_model.eval()
     val_iter = iter(val_loader)
     with torch.no_grad():
         for i in range(min(5, len(val_loader))):
             images, targets = next(val_iter)
             images = [img.to(device) for img in images]
-            outputs = model(images)
+            outputs = core_model(images)
 
             image_np = images[0].cpu().permute(1, 2, 0).numpy()
             image_pil = Image.fromarray((image_np * 255).astype(np.uint8))
@@ -546,6 +767,9 @@ def main():
                 score_threshold=0.6,
                 output_name=f"{FIGURES_PATH}/prediction_{i+1}.png"
             )
+
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
