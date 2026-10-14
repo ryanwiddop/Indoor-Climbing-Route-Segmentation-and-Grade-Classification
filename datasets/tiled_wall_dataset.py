@@ -5,6 +5,7 @@ import random
 import numpy as np
 import torch
 import torchvision.transforms.functional as F
+import torchvision.transforms as T
 from PIL import Image, ImageDraw, ImageOps
 from pycocotools.coco import COCO
 from torch.utils.data import Dataset
@@ -128,10 +129,14 @@ class TiledWallDataset(Dataset):
                 image_tensor = F.hflip(image_tensor)
                 masks_t = torch.flip(masks_t, dims=[2])
                 boxes_t[:, [0, 2]] = W - boxes_t[:, [2, 0]]
+            # if random.random() < 0.5:
+            #     image_tensor = F.vflip(image_tensor)
+            #     masks_t = torch.flip(masks_t, dims=[1])
+            #     boxes_t[:, [1, 3]] = H - boxes_t[:, [3, 1]]
             if random.random() < 0.5:
-                image_tensor = F.vflip(image_tensor)
-                masks_t = torch.flip(masks_t, dims=[1])
-                boxes_t[:, [1, 3]] = H - boxes_t[:, [3, 1]]
+                image_tensor = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)(image_tensor)
+            if random.random() < 0.5:
+                image_tensor = T.GaussianBlur(kernel_size=random.choice([3, 5, 7]))(image_tensor)
 
         target = {
             "boxes": boxes_t,
