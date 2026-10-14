@@ -18,3 +18,4 @@ annotate_colors.py
 tune_color_bin.py
 merge_coco.py
 via_to_cvat_coco.py
+predict_to_coco.py
