@@ -118,7 +118,7 @@ def parse_args():
     p.add_argument("img_dir")
     p.add_argument("coco_json")
     p.add_argument("out_dir")
-    p.add_argument("--tile-size", type=int, default=1600)
+    p.add_argument("--tile-size", type=int, default=800)
     p.add_argument("--overlap", type=float, default=0.66)
     p.add_argument("--min-overlap-frac", type=float, default=0.35,
                    help="Min fraction of hold bbox that must overlap tile")
