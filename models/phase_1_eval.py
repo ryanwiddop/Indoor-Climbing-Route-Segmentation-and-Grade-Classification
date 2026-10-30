@@ -50,6 +50,7 @@ DEFAULT_LOG_DIR = os.path.join(HERE, "logs")
 LOG_FILE = os.path.join(DEFAULT_LOG_DIR, "phase_1_eval.log")
 
 VOLUME_NAME = "volume"
+DEFAULT_SWEEP = ",".join(f"{t:.2f}" for t in np.arange(0.05, 1.0, 0.05))
 
 logger = logging.getLogger("phase_1_eval")
 
@@ -80,6 +81,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42,
                    help="Must match the value prepare_tiles.py was run with")
     p.add_argument("--score-threshold", type=float, default=0.6)
+    p.add_argument("--sweep", nargs="?", const=DEFAULT_SWEEP, default=None,
+                   metavar="T1,T2,...",
+                   help="Re-score at several score thresholds and report a table. "
+                        f"Bare --sweep uses {DEFAULT_SWEEP}")
     p.add_argument("--iou-threshold", type=float, default=0.5)
     p.add_argument("--max-detections", type=int, default=500)
     p.add_argument("--tile-size", type=int, default=1600)
@@ -324,6 +329,179 @@ def summarise_group(stats, class_ids):
     }
 
 
+def score_at_threshold(per_image, class_ids, score_threshold, iou_threshold,
+                       with_mask_iou=True):
+    stats = {
+        "tp": defaultdict(int), "fp": defaultdict(int), "fn": defaultdict(int),
+        "box_ious": defaultdict(list), "mask_ious": defaultdict(list),
+        "score_tp": [], "score_fp": [],
+    }
+    per_img_stats = []
+
+    # Class-aware matching throws away the pred<->GT pairing whenever the types
+    # disagree, so it cannot say WHICH types get confused. The confusion matrix
+    # therefore comes from a second, localization-only pass.
+    n_cls = len(class_ids)
+    pos = {c: k for k, c in enumerate(class_ids)}
+    NONE_IDX = n_cls
+    cm = np.zeros((n_cls + 1, n_cls + 1), dtype=np.int64)
+
+    for rec in per_image:
+        keep = rec["pred_scores"] >= score_threshold
+        pb = rec["pred_boxes"][keep]
+        ps = rec["pred_scores"][keep]
+        pl = rec["pred_labels"][keep]
+        pm = [rec["pred_masks"][i] for i, k in enumerate(keep.tolist()) if k]
+
+        gb = rec["gt_boxes"]
+        gl = rec["gt_labels"]
+
+        matches, ious = greedy_match_classaware(pb, ps, pl, gb, gl, iou_threshold)
+        matched_gt = {m for m in matches if m != -1}
+
+        for i, m in enumerate(matches):
+            c = int(pl[i])
+            if m != -1:
+                stats["tp"][c] += 1
+                stats["box_ious"][c].append(ious[i])
+                if with_mask_iou:
+                    stats["mask_ious"][c].append(
+                        mask_iou_local(pm[i], rec["gt_polygons"][m], pb[i], rec["image_size"]))
+                stats["score_tp"].append(float(ps[i]))
+            else:
+                stats["fp"][c] += 1
+                stats["score_fp"].append(float(ps[i]))
+
+        for j in range(len(gb)):
+            if j not in matched_gt:
+                stats["fn"][int(gl[j])] += 1
+
+        loc_matches, _ = greedy_match(pb, ps, gb, iou_threshold)
+        loc_matched_gt = {m for m in loc_matches if m != -1}
+        for i, m in enumerate(loc_matches):
+            if m != -1:
+                cm[pos[int(gl[m])], pos[int(pl[i])]] += 1
+            else:
+                cm[NONE_IDX, pos[int(pl[i])]] += 1
+        for j in range(len(gb)):
+            if j not in loc_matched_gt:
+                cm[pos[int(gl[j])], NONE_IDX] += 1
+
+        n_tp = len(matched_gt)
+        per_img_stats.append({
+            "filename": rec["filename"],
+            "gt_count": int(len(gb)),
+            "pred_count_raw": int(len(rec["pred_boxes"])),
+            "pred_count_kept": int(keep.sum()),
+            "tp": int(n_tp),
+            "fp": int(len(matches) - n_tp),
+            "fn": int(len(gb) - n_tp),
+            "recall": n_tp / max(len(gb), 1),
+            "precision": n_tp / max(len(matches), 1),
+        })
+
+    return stats, cm, per_img_stats
+
+
+def summarise_localization(cm, n_cls):
+    tp = int(cm[:n_cls, :n_cls].sum())
+    fp = int(cm[n_cls, :n_cls].sum())
+    fn = int(cm[:n_cls, n_cls].sum())
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+    correct = int(np.trace(cm[:n_cls, :n_cls]))
+    return {
+        "found": tp, "spurious": fp, "missed": fn,
+        "precision": float(precision), "recall": float(recall), "f1": float(f1),
+        "type_correct": correct,
+        "type_accuracy_on_found": correct / max(tp, 1),
+    }
+
+
+def sweep_thresholds(per_image, class_ids, volume_id, thresholds, iou_threshold):
+    hold_ids = [c for c in class_ids if c != volume_id]
+    rows = []
+    for t in tqdm(thresholds, desc="Threshold sweep", unit="thr"):
+        stats, cm, _ = score_at_threshold(
+            per_image, class_ids, t, iou_threshold, with_mask_iou=False)
+        rows.append({
+            "score_threshold": float(t),
+            "localization": summarise_localization(cm, len(class_ids)),
+            "all_classes": summarise_group(stats, class_ids),
+            "holds_only": summarise_group(stats, hold_ids),
+        })
+    return rows
+
+
+def log_sweep(rows, current_threshold):
+    logger.info("-" * 104)
+    logger.info("Score-threshold sweep (IoU>=gate fixed; localization is class-agnostic, "
+                "TP/FP/FN are class-aware)")
+    logger.info("%5s %7s %9s %7s %7s %8s %6s %6s %6s %7s %7s %7s",
+                "thr", "found", "spurious", "missed", "locF1", "typeAcc",
+                "TP", "FP", "FN", "P", "R", "F1")
+    for r in rows:
+        loc, cls = r["localization"], r["all_classes"]
+        logger.info("%5.2f %7d %9d %7d %7.4f %8.4f %6d %6d %6d %7.4f %7.4f %7.4f",
+                    r["score_threshold"], loc["found"], loc["spurious"], loc["missed"],
+                    loc["f1"], loc["type_accuracy_on_found"],
+                    cls["TP"], cls["FP"], cls["FN"],
+                    cls["precision"], cls["recall"], cls["f1"])
+
+    best_all = max(rows, key=lambda r: r["all_classes"]["f1"])
+    best_holds = max(rows, key=lambda r: r["holds_only"]["f1"])
+    current = min(rows, key=lambda r: abs(r["score_threshold"] - current_threshold))
+    logger.info("-" * 104)
+    logger.info("Best class-aware F1 (all classes): %.4f at thr=%.2f   "
+                "(current thr=%.2f gives %.4f, delta %+.4f)",
+                best_all["all_classes"]["f1"], best_all["score_threshold"],
+                current["score_threshold"], current["all_classes"]["f1"],
+                best_all["all_classes"]["f1"] - current["all_classes"]["f1"])
+    logger.info("Best class-aware F1 (holds only) : %.4f at thr=%.2f",
+                best_holds["holds_only"]["f1"], best_holds["score_threshold"])
+    return best_all, best_holds
+
+
+def plot_sweep(rows, current_threshold, best_threshold, output_path):
+    thr = [r["score_threshold"] for r in rows]
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2, 1, figsize=(10, 9), sharex=True, gridspec_kw={"height_ratios": [1, 1]})
+
+    for key, label, color in (("found", "found (TP, class-agnostic)", "#2ca02c"),
+                              ("spurious", "spurious (FP)", "#d62728"),
+                              ("missed", "missed (FN)", "#ff7f0e")):
+        ax_top.plot(thr, [r["localization"][key] for r in rows],
+                    marker="o", ms=3.5, linewidth=1.8, label=label, color=color)
+    ax_top.set_ylabel("Detections")
+    ax_top.set_title("Localization counts vs score threshold")
+    ax_top.legend(fontsize=8); ax_top.grid(alpha=0.3)
+
+    for vals, label, color in (
+            ([r["all_classes"]["f1"] for r in rows], "class-aware F1 (all)", "#1f77b4"),
+            ([r["holds_only"]["f1"] for r in rows], "class-aware F1 (holds)", "#9467bd"),
+            ([r["localization"]["f1"] for r in rows], "localization F1", "#2ca02c"),
+            ([r["localization"]["type_accuracy_on_found"] for r in rows],
+             "type accuracy on found", "#8c564b")):
+        ax_bot.plot(thr, vals, marker="o", ms=3.5, linewidth=1.8, label=label, color=color)
+    ax_bot.set_xlabel("Score threshold"); ax_bot.set_ylabel("Score")
+    ax_bot.set_ylim(0, 1.02)
+    ax_bot.set_title("Quality vs score threshold")
+    ax_bot.legend(fontsize=8); ax_bot.grid(alpha=0.3)
+
+    for ax in (ax_top, ax_bot):
+        ax.axvline(current_threshold, color="black", linestyle="--", linewidth=1.2)
+        ax.axvline(best_threshold, color="#1f77b4", linestyle=":", linewidth=1.6)
+    ax_bot.text(current_threshold, 0.02, f" current {current_threshold:.2f}",
+                fontsize=8, rotation=90, va="bottom")
+    ax_bot.text(best_threshold, 0.02, f" best {best_threshold:.2f}",
+                fontsize=8, rotation=90, va="bottom", color="#1f77b4")
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180)
+    plt.close()
+
+
 def main():
     setup_logger()
     args = parse_args()
@@ -422,73 +600,11 @@ def main():
     volume_id = hold_type_to_idx.get(VOLUME_NAME)
     hold_ids = [c for c in class_ids if c != volume_id]
 
-    stats = {
-        "tp": defaultdict(int), "fp": defaultdict(int), "fn": defaultdict(int),
-        "box_ious": defaultdict(list), "mask_ious": defaultdict(list),
-        "score_tp": [], "score_fp": [],
-    }
-    per_img_stats = []
-
-    # Class-aware matching throws away the pred<->GT pairing whenever the types
-    # disagree, so it cannot say WHICH types get confused. The confusion matrix
-    # therefore comes from a second, localization-only pass.
     n_cls = len(class_ids)
-    pos = {c: k for k, c in enumerate(class_ids)}
     NONE_IDX = n_cls
-    cm = np.zeros((n_cls + 1, n_cls + 1), dtype=np.int64)
 
-    for rec in per_image:
-        keep = rec["pred_scores"] >= args.score_threshold
-        pb = rec["pred_boxes"][keep]
-        ps = rec["pred_scores"][keep]
-        pl = rec["pred_labels"][keep]
-        pm = [rec["pred_masks"][i] for i, k in enumerate(keep.tolist()) if k]
-
-        gb = rec["gt_boxes"]
-        gl = rec["gt_labels"]
-
-        matches, ious = greedy_match_classaware(pb, ps, pl, gb, gl, args.iou_threshold)
-        matched_gt = {m for m in matches if m != -1}
-
-        for i, m in enumerate(matches):
-            c = int(pl[i])
-            if m != -1:
-                stats["tp"][c] += 1
-                stats["box_ious"][c].append(ious[i])
-                stats["mask_ious"][c].append(
-                    mask_iou_local(pm[i], rec["gt_polygons"][m], pb[i], rec["image_size"]))
-                stats["score_tp"].append(float(ps[i]))
-            else:
-                stats["fp"][c] += 1
-                stats["score_fp"].append(float(ps[i]))
-
-        for j in range(len(gb)):
-            if j not in matched_gt:
-                stats["fn"][int(gl[j])] += 1
-
-        loc_matches, _ = greedy_match(pb, ps, gb, args.iou_threshold)
-        loc_matched_gt = {m for m in loc_matches if m != -1}
-        for i, m in enumerate(loc_matches):
-            if m != -1:
-                cm[pos[int(gl[m])], pos[int(pl[i])]] += 1
-            else:
-                cm[NONE_IDX, pos[int(pl[i])]] += 1
-        for j in range(len(gb)):
-            if j not in loc_matched_gt:
-                cm[pos[int(gl[j])], NONE_IDX] += 1
-
-        n_tp = len(matched_gt)
-        per_img_stats.append({
-            "filename": rec["filename"],
-            "gt_count": int(len(gb)),
-            "pred_count_raw": int(len(rec["pred_boxes"])),
-            "pred_count_kept": int(keep.sum()),
-            "tp": int(n_tp),
-            "fp": int(len(matches) - n_tp),
-            "fn": int(len(gb) - n_tp),
-            "recall": n_tp / max(len(gb), 1),
-            "precision": n_tp / max(len(matches), 1),
-        })
+    stats, cm, per_img_stats = score_at_threshold(
+        per_image, class_ids, args.score_threshold, args.iou_threshold)
 
     overall = summarise_group(stats, class_ids)
     holds_only = summarise_group(stats, hold_ids)
@@ -507,14 +623,11 @@ def main():
                     f"{grp['mean_matched_box_iou']:.4f}" if grp["mean_matched_box_iou"] is not None else "n/a",
                     f"{grp['mean_matched_mask_iou']:.4f}" if grp["mean_matched_mask_iou"] is not None else "n/a")
 
-    loc_tp = int(cm[:n_cls, :n_cls].sum())
-    loc_fp = int(cm[NONE_IDX, :n_cls].sum())
-    loc_fn = int(cm[:n_cls, NONE_IDX].sum())
-    loc_precision = loc_tp / max(loc_tp + loc_fp, 1)
-    loc_recall = loc_tp / max(loc_tp + loc_fn, 1)
-    loc_f1 = 2 * loc_precision * loc_recall / max(loc_precision + loc_recall, 1e-12)
-    type_correct = int(np.trace(cm[:n_cls, :n_cls]))
-    type_accuracy = type_correct / max(loc_tp, 1)
+    loc = summarise_localization(cm, n_cls)
+    loc_tp, loc_fp, loc_fn = loc["found"], loc["spurious"], loc["missed"]
+    loc_precision, loc_recall, loc_f1 = loc["precision"], loc["recall"], loc["f1"]
+    type_correct = loc["type_correct"]
+    type_accuracy = loc["type_accuracy_on_found"]
 
     logger.info("-" * 72)
     logger.info("Localization only (class-agnostic, same IoU gate):")
@@ -533,6 +646,15 @@ def main():
         logger.info("%-8s%s%7d", names[r][:7], row, cm[r, NONE_IDX])
     logger.info("%-8s%s%7s", "SPURIOUS",
                 "".join(f"{cm[NONE_IDX, k]:>7d}" for k in range(n_cls)), "-")
+
+    sweep_rows = None
+    if args.sweep:
+        thresholds = sorted({float(t) for t in args.sweep.split(",") if t.strip()})
+        sweep_rows = sweep_thresholds(
+            per_image, class_ids, volume_id, thresholds, args.iou_threshold)
+        best_all, _ = log_sweep(sweep_rows, args.score_threshold)
+        plot_sweep(sweep_rows, args.score_threshold, best_all["score_threshold"],
+                   os.path.join(args.output_dir, "phase_1_eval_threshold_sweep.png"))
 
     iou_range_coco = [round(x, 2) for x in np.arange(0.5, 1.0, 0.05)]
     per_class_ap = compute_per_class_ap(per_image, iou_range_coco, class_ids)
@@ -751,6 +873,7 @@ def main():
                 for c in class_ids
             },
         },
+        "threshold_sweep": sweep_rows,
         "per_image": per_img_stats,
         "config": {
             "checkpoint": args.checkpoint,
