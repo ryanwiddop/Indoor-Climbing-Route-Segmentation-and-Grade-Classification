@@ -39,8 +39,7 @@ ERODE_FRAC = 0.1
 
 
 class CroppedHoldDataset(Dataset):
-    def __init__(self, img_dir, coco_json, size=224, augment=False, vflip=False,
-                 transform=None):
+    def __init__(self, img_dir, coco_json, size=224, augment=False, vflip=False, transform=None):
         self.img_dir = img_dir
         self.size = size
         self.augment = augment
@@ -167,9 +166,7 @@ class CroppedHoldDataset(Dataset):
                 image = F.vflip(image)
                 mask = mask[::-1].copy()
             if random.random() < 0.5:
-                image = T.ColorJitter(
-                    brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1
-                )(image)
+                image = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)(image)
 
         med_L, med_a, med_b = self._lab_stats(np.array(image), self._erode(mask))
 
