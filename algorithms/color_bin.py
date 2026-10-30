@@ -14,10 +14,14 @@ REPO_ROOT = os.path.dirname(HERE)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from model.phase_1 import load_model, tiled_predict
+try:
+    from ..models.phase_1 import load_model, tiled_predict
+except ImportError:
+    from models.phase_1 import load_model, tiled_predict
 
-DEFAULT_CKPT = os.path.join(REPO_ROOT, "model", "checkpoints", "phase_1.pt")
+DEFAULT_CKPT = os.path.join(REPO_ROOT, "models", "checkpoints", "phase_1.pt")
 LOG_FILE_PATH = os.path.join(HERE, "logs/color_bin.log")
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -114,7 +118,8 @@ def _name_color_lab(bgr_image, mask, idx):
     return color
 
 
-def color_bin_lab(image, model, device="cuda", tile_size=800, overlap=0.25, score_threshold=0.3, nms_iou=0.5):
+
+def color_bin_lab(image, model, device="cuda", tile_size=1600, overlap=0.66, score_threshold=0.3, nms_iou=0.5, volume_label=None):
     if image is None:
         raise ValueError("Input image is None. Check the image path and file readability.")
 
@@ -129,7 +134,8 @@ def color_bin_lab(image, model, device="cuda", tile_size=800, overlap=0.25, scor
         tile_size=tile_size,
         overlap=overlap,
         score_threshold=score_threshold,
-        nms_iou=nms_iou
+        nms_iou=nms_iou,
+        volume_label=volume_label,
     )
 
     masks_to_colors = defaultdict(list)
@@ -176,7 +182,7 @@ def visualize_bins(image, masks_to_colors):
         
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, _, _ = load_model(DEFAULT_CKPT, device)
+    model, hold_type_to_idx, _ = load_model(DEFAULT_CKPT, device)
     image_path = "/home/public/rwiddop/images/00.jpg"
     image = cv2.imread(image_path)
 
@@ -184,7 +190,8 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(image_path))[0]
 
-    masks_lab = color_bin_lab(image, model, device=device)
+    masks_lab = color_bin_lab(image, model, device=device,
+                              volume_label=hold_type_to_idx.get("volume"))
     out_lab = visualize_bins(image, masks_lab)
     cv2.imwrite(os.path.join(output_dir, base + "_lab.png"), out_lab)
     print(f"Saved -> {os.path.join(output_dir, base + "_lab.png")}")
