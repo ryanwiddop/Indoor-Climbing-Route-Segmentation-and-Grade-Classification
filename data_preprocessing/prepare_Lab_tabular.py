@@ -10,37 +10,6 @@ import pandas as pd
 
 WHOLE_IMG_PATH = "/home/public/rwiddop/images/"
 ANNOTATIONS_PATH = "/home/public/rwiddop/annotations.json"
-LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "logs/phase_2.log")
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-if not logger.handlers:
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-
-    file_handler = logging.FileHandler(LOG_FILE_PATH)
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setLevel(logging.INFO)
-    stream_handler.setFormatter(formatter)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
-    logger.propagate = False
-
-
-def log_script_start():
-    separator = "=" * 80
-    started_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    logger.info(
-        "\n%s\nPHASE 2 SCRIPT STARTED | %s | pid=%s\n%s",
-        separator,
-        started_at,
-        os.getpid(),
-        separator,
-    )
     
     
 def load_annotations(annotations_path, image_files):
@@ -102,8 +71,6 @@ def extract_clab_from_ann(ann, lab_image):
 
 
 def main():
-    log_script_start()
-    logger.info("Generating Lab centroids from training data...")
     image_files = sorted([f for f in os.listdir(WHOLE_IMG_PATH) if f.endswith(".jpg") or f.endswith(".png")])
     image_to_annotations = load_annotations(ANNOTATIONS_PATH, image_files)
     image_to_clab_data = defaultdict(list)
@@ -111,7 +78,7 @@ def main():
         image_path = os.path.join(WHOLE_IMG_PATH, image_file)
         image = cv2.imread(image_path)
         if image is None:
-            logger.warning(f"Failed to read image: {image_path}")
+            print(f"Failed to read image: {image_path}")
             continue
                 
         lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2Lab)
@@ -121,15 +88,30 @@ def main():
                 image_to_clab_data[image_file].append(clab_data)
         
         print(f"Processed {len(image_to_annotations.get(image_file, []))} annotations for image: {image_file}")
-        
-    #save to csv
+    
+    # give each route unique route id across all images            
+    route_id_map = {}
+    next_id = 1
+    for image_file, clab_list in image_to_clab_data.items():
+        for clab in clab_list:
+            route_id = clab["route_id"]
+            if route_id not in route_id_map:
+                route_id_map[route_id] = next_id
+                next_id += 1
+            clab["route_id"] = route_id_map[route_id]
+        route_id_map.clear()
+    
+    # save to csv
     all_clab_data = []
     for image_file, clab_list in image_to_clab_data.items():
         for clab in clab_list:
             clab["image_file"] = image_file
             all_clab_data.append(clab)
+            
     df = pd.DataFrame(all_clab_data)
     df.to_csv("clab_data.csv", index=False)
+    
+    print(f"Saved {len(df)} holds, across {next_id - 1} unique routes, to clab_data.csv")
     
     
 if __name__ == "__main__":
