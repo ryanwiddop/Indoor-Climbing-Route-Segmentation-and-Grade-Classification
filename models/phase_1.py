@@ -168,13 +168,10 @@ def _ap_from_flags(sorted_tp, num_gt):
     return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
 
 
-def validate_map(model, loader, device, num_classes, iou_thresh=0.5):
-    """Class-aware mAP@iou_thresh over the loader. Selection metric for checkpoints:
-    val *loss* bottoms out within a few epochs and then rises while mAP keeps
-    improving, so loss is not a usable early-stopping signal for detection."""
+def validate_map(model, loader, device, num_classes, iou_thresholds=tuple(np.arange(0.5, 1.0, 0.05))):
     was_training = model.training
     model.eval()
-    acc = {c: {"scores": [], "tp": [], "n_gt": 0} for c in range(1, num_classes)}
+    per_class = {c: [] for c in range(1, num_classes)}
 
     with torch.no_grad():
         for images, targets in loader:
@@ -187,33 +184,40 @@ def validate_map(model, loader, device, num_classes, iou_thresh=0.5):
                 pb = output["boxes"].cpu().numpy()
                 pl = output["labels"].cpu().numpy()
                 ps = output["scores"].cpu().numpy()
-                for c, a in acc.items():
+                for c, bucket in per_class.items():
                     g = gt_boxes[gt_labels == c]
-                    a["n_gt"] += len(g)
                     m = pl == c
-                    if not m.any():
-                        continue
                     cb, cs = pb[m], ps[m]
-                    taken = np.zeros(len(g), dtype=bool)
-                    for i in np.argsort(-cs):
-                        a["scores"].append(float(cs[i]))
-                        if len(g) == 0:
-                            a["tp"].append(0.0)
-                            continue
-                        ious = _iou_vec(cb[i], g)
-                        ious[taken] = -1.0
-                        j = int(np.argmax(ious))
-                        hit = ious[j] >= iou_thresh
-                        taken[j] |= hit
-                        a["tp"].append(1.0 if hit else 0.0)
+                    order = np.argsort(-cs)
+                    cb, cs = cb[order], cs[order]
+                    ious = (np.stack([_iou_vec(b, g) for b in cb])
+                            if len(cs) and len(g) else np.zeros((len(cs), len(g))))
+                    bucket.append((len(g), cs, ious))
 
     aps = []
-    for a in acc.values():
-        if a["n_gt"] == 0:
+    for bucket in per_class.values():
+        n_gt = sum(n for n, _, _ in bucket)
+        if n_gt == 0:
             continue
-        scores = np.asarray(a["scores"], dtype=np.float64)
-        flags = np.asarray(a["tp"], dtype=np.float64)
-        aps.append(_ap_from_flags(flags[np.argsort(-scores)], a["n_gt"]))
+        for thresh in iou_thresholds:
+            scores, flags = [], []
+            for n_g, cs, ious in bucket:
+                taken = np.zeros(n_g, dtype=bool)
+                for i in range(len(cs)):
+                    scores.append(cs[i])
+                    if n_g == 0:
+                        flags.append(0.0)
+                        continue
+                    row = np.where(taken, -1.0, ious[i])
+                    j = int(np.argmax(row))
+                    hit = row[j] >= thresh
+                    taken[j] |= hit
+                    flags.append(1.0 if hit else 0.0)
+            if scores:
+                order = np.argsort(-np.asarray(scores))
+                aps.append(_ap_from_flags(np.asarray(flags)[order], n_gt))
+            else:
+                aps.append(0.0)
 
     model.train(was_training)
     return float(np.mean(aps)) if aps else 0.0
@@ -279,7 +283,6 @@ def _iter_tiles(H, W, tile, overlap):
 
 
 def _iou_vec(box, others):
-    """IoU of `box` against each row of `others`."""
     x1 = np.maximum(box[0], others[:, 0]); y1 = np.maximum(box[1], others[:, 1])
     x2 = np.minimum(box[2], others[:, 2]); y2 = np.minimum(box[3], others[:, 3])
     inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
@@ -301,7 +304,6 @@ def _crop_mask_to_bbox(mask, box, img_h, img_w):
 
 
 def _ios_vec(box, others):
-    """Intersection over smaller area: high when one box is *contained* in the other."""
     x1 = np.maximum(box[0], others[:, 0]); y1 = np.maximum(box[1], others[:, 1])
     x2 = np.minimum(box[2], others[:, 2]); y2 = np.minimum(box[3], others[:, 3])
     inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
@@ -312,15 +314,6 @@ def _ios_vec(box, others):
 
 
 def _merge_tiles(boxes, scores, labels, seam, iou_thresh=0.5, ios_thresh=0.8, volume_label=None):
-    """Merge per-tile detections into wall-level ones.
-
-    Two halves of one hold seen from adjacent tiles overlap at IoU ~0.38 (max
-    0.498 measured on this dataset), which sits under any usable NMS gate, so
-    plain IoU-NMS keeps both and the hold comes out sliced along the tile edge.
-    A seam fragment is however almost exactly *contained* in the intact
-    detection from the neighbouring tile (IoS ~1.0), so containment is the
-    criterion that separates a fragment from a genuinely distinct hold.
-    """
     order = sorted(range(len(boxes)), key=lambda i: (bool(seam[i]), -scores[i]))
     keep = []
     while order:
@@ -339,7 +332,7 @@ def _merge_tiles(boxes, scores, labels, seam, iou_thresh=0.5, ios_thresh=0.8, vo
     return np.asarray(keep, dtype=np.int64)
 
 
-def tiled_predict(model, image_tensor_cpu, device, tile_size=1600, overlap=0.66,
+def tiled_predict(model, image_tensor_cpu, device, tile_size=800, overlap=0.66,
     score_threshold=0.05, nms_iou=0.5, ios_thresh=0.8, seam_margin=2, volume_label=None):
 
     C, H, W = image_tensor_cpu.shape
@@ -450,6 +443,7 @@ def main():
 
     
     BATCH_SIZE = 16
+    EVAL_BATCH_SIZE = 8
     NUM_WORKERS = 8
     NUM_EPOCHS = 45
 
@@ -468,7 +462,7 @@ def main():
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=EVAL_BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
         collate_fn=collate_fn,
@@ -589,7 +583,7 @@ def main():
                         "val_map_history": val_map_history,
                     }, CHECKPOINT_PATH)
                 logger.info(
-                    "Epoch %d/%d - train %.4f - val %.4f - mAP@.5 %.4f%s - %.1fs",
+                    "Epoch %d/%d - train %.4f - val %.4f - mAP@[.5:.95] %.4f%s - %.1fs",
                     epoch + 1, NUM_EPOCHS, avg_train_loss, avg_val_loss, val_map,
                     "  *best*" if improved else "",
                     time.perf_counter() - last_epoch_time,
@@ -600,7 +594,7 @@ def main():
     elapsed_time = end_time - start_time
     logger.info(f"Training completed in {elapsed_time:.2f} seconds")
     logger.info(f"Best Train Loss: {best_train_loss:.4f} at epoch {best_loss_epoch}")
-    logger.info(f"Best Val mAP@.5: {best_val_map:.4f} at epoch {best_val_epoch} of {NUM_EPOCHS} (best val loss seen: {best_val_loss:.4f})")
+    logger.info(f"Best Val mAP@[.5:.95]: {best_val_map:.4f} at epoch {best_val_epoch} of {NUM_EPOCHS} (best val loss seen: {best_val_loss:.4f})")
     
     if distributed:
         dist.barrier()
@@ -610,7 +604,7 @@ def main():
     
     ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
     core_model.load_state_dict(ckpt["model_state_dict"])
-    logger.info(f"Evaluating best checkpoint (epoch {ckpt['epoch']}, val_mAP@.5={ckpt['val_map']:.4f}, val_loss={ckpt['val_loss']:.4f}) from {CHECKPOINT_PATH}")
+    logger.info(f"Evaluating best checkpoint (epoch {ckpt['epoch']}, val_mAP@[.5:.95]={ckpt['val_map']:.4f}, val_loss={ckpt['val_loss']:.4f}) from {CHECKPOINT_PATH}")
     
     core_model.eval()
     iou_threshold = 0.5
@@ -729,8 +723,8 @@ def main():
     ax.set_xticks(range(1, NUM_EPOCHS + 1, max(1, NUM_EPOCHS // 15)))
     ax.grid()
     ax2 = ax.twinx()
-    ax2.plot(range(1, len(val_map_history) + 1), val_map_history, marker="^", color="tab:red", label="val mAP@.5")
-    ax2.set_ylabel("val mAP@.5")
+    ax2.plot(range(1, len(val_map_history) + 1), val_map_history, marker="^", color="tab:red", label="val mAP@[.5:.95]")
+    ax2.set_ylabel("val mAP@[.5:.95]")
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, loc="center right")
