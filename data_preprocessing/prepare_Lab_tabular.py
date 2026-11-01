@@ -21,7 +21,11 @@ def load_annotations(annotations_path, image_files):
     for ann in data["annotations"]:
         if ann["image_id"] in wanted:
             image_to_annotations[wanted[ann["image_id"]]].append(ann)
-    return image_to_annotations
+    for cat in data["categories"]:
+        if cat["name"].lower() == "volume":
+            volume_category_id = cat["id"]
+            break
+    return image_to_annotations, volume_category_id
 
 
 def extract_clab_from_ann(ann, lab_image):
@@ -72,7 +76,7 @@ def extract_clab_from_ann(ann, lab_image):
 
 def main():
     image_files = sorted([f for f in os.listdir(WHOLE_IMG_PATH) if f.endswith(".jpg") or f.endswith(".png")])
-    image_to_annotations = load_annotations(ANNOTATIONS_PATH, image_files)
+    image_to_annotations, volume_category_id = load_annotations(ANNOTATIONS_PATH, image_files)
     image_to_clab_data = defaultdict(list)
     for image_file in image_files:
         image_path = os.path.join(WHOLE_IMG_PATH, image_file)
@@ -87,13 +91,15 @@ def main():
             if clab_data is not None:
                 image_to_clab_data[image_file].append(clab_data)
         
-        print(f"Processed {len(image_to_annotations.get(image_file, []))} annotations for image: {image_file}")
+        print(f"{image_file}\t| {len(image_to_clab_data.get(image_file, []))} holds processed")
     
-    # give each route unique route id across all images            
+    # give each route unique route id across all images, ignore volumes          
     route_id_map = {}
     next_id = 1
     for image_file, clab_list in image_to_clab_data.items():
         for clab in clab_list:
+            if clab["category_id"] == volume_category_id:
+                continue
             route_id = clab["route_id"]
             if route_id not in route_id_map:
                 route_id_map[route_id] = next_id
@@ -112,6 +118,7 @@ def main():
     df.to_csv("clab_data.csv", index=False)
     
     print(f"Saved {len(df)} holds, across {next_id - 1} unique routes, to clab_data.csv")
+    print(f"Volume category id: {volume_category_id}")
     
     
 if __name__ == "__main__":
