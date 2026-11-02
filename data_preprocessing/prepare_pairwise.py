@@ -19,6 +19,8 @@ def calculate_wall_scale(holds):
 
 def create_pair(i, j, wall_scale):
     pair = {
+        "i_id": i["id"],
+        "j_id": j["id"],
         "image_file": i["image_file"],
         "dx_normalized": abs(i["cx"] - j["cx"]) / wall_scale,
         "dy_normalized": abs(i["cy"] - j["cy"]) / wall_scale,
@@ -36,7 +38,9 @@ def create_pair(i, j, wall_scale):
         "same_cat": int(i["category_id"] == j["category_id"]),
         "area_ratio": min(i["area"], j["area"]) / max(i["area"], j["area"]),
         "absolute_area": abs(i["area"] - j["area"]) / wall_scale**2,
-        "same_route": int(i["route_id"] == j["route_id"])
+        "same_route": int(i["route_id"] == j["route_id"]),
+        "i_route": i["route_id"],
+        "j_route": j["route_id"]
     }
     return pair
 
