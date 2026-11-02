@@ -5,6 +5,7 @@ channels:
 dependencies:
   - _libgcc_mutex=0.1=main
   - _openmp_mutex=5.1=1_gnu
+  - _py-xgboost-mutex=2.0=cpu_4
   - alsa-lib=1.2.15.3=h47b2149_0
   - aom=3.12.1=h7934f7d_0
   - attr=2.5.2=h47b2149_0
@@ -21,7 +22,7 @@ dependencies:
   - blinker=1.9.0=py314h06a4308_1
   - bzip2=1.0.8=h5eee18b_6
   - c-ares=1.34.6=hd44998d_0
-  - ca-certificates=2026.9.25=h06a4308_0
+  - ca-certificates=2026.10.23=hbd8a1cb_0
   - cairo=1.18.4=h44eff21_0
   - click=8.2.1=py314h06a4308_1
   - contourpy=1.3.3=py314hdb19cb5_0
@@ -166,6 +167,7 @@ dependencies:
   - libwebp=1.6.0=h089d785_0
   - libwebp-base=1.6.0=hb7bb969_0
   - libxcb=1.17.0=h9b100fa_0
+  - libxgboost=3.4.1=cpu_h42429d7_0
   - libxkbcommon=1.9.1=h69220b7_0
   - libxml2=2.13.9=h2c43086_0
   - libzlib=1.3.1=hb25bd0a_0
@@ -196,7 +198,7 @@ dependencies:
   - openh264=2.6.0=ha05cbb4_1
   - openjpeg=2.5.4=h4e0627c_1
   - openldap=2.6.12=hb446bd0_0
-  - openssl=3.5.9=h1b28b03_0
+  - openssl=3.6.5=h781a0a9_0
   - optree=0.18.0=py314h24d9097_0
   - packaging=26.0=py314h06a4308_0
   - pandas=3.0.2=py314h973aee8_0
@@ -210,6 +212,7 @@ dependencies:
   - pulseaudio-client=17.0=hed6b5c4_0
   - pulseaudio-daemon=17.0=h1a6afb5_0
   - py-spy=0.4.1=he930205_0
+  - py-xgboost=3.4.1=cpu_py314h2e0b463_0
   - pybind11-abi=5=hd3eb1b0_0
   - pycocotools=2.0.11=py314hc02f841_0
   - pyparsing=3.2.5=py314h06a4308_0
@@ -263,6 +266,7 @@ dependencies:
   - xcb-util-keysyms=0.4.1=h5eee18b_0
   - xcb-util-renderutil=0.3.10=h5eee18b_0
   - xcb-util-wm=0.4.2=h5eee18b_0
+  - xgboost=3.4.1=cpu_py314h2e0b463_0
   - xkeyboard-config=2.44=h382ed1a_1
   - xorg-libice=1.1.2=h9b100fa_0
   - xorg-libsm=1.2.6=h9b100fa_0
