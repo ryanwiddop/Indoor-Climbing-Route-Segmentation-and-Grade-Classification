@@ -38,7 +38,7 @@ for _p in (HERE, PROJECT_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from phase_1 import box_iou, load_model, tiled_predict
+from models.phase_1_cnn import box_iou, load_model, tiled_predict
 from datasets.whole_wall_dataset import WholeWallDataset, collate_fn
 from data_preprocessing.prepare_tiles import split_walls
 

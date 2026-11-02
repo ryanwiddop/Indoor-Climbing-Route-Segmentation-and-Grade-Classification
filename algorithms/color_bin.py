@@ -15,9 +15,9 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 try:
-    from ..models.phase_1 import load_model, tiled_predict
+    from ..models.phase_1_cnn import load_model, tiled_predict
 except ImportError:
-    from models.phase_1 import load_model, tiled_predict
+    from models.phase_1_cnn import load_model, tiled_predict
 
 DEFAULT_CKPT = os.path.join(REPO_ROOT, "models", "checkpoints", "phase_1.pt")
 LOG_FILE_PATH = os.path.join(HERE, "logs/color_bin.log")
