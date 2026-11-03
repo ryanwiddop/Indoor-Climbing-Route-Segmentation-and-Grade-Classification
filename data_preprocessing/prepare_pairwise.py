@@ -3,6 +3,9 @@ import pandas as pd
 from collections import defaultdict
 
 VOLUME_CATEGORY_ID = 1
+HUE_BINS = 16
+HUE_COLS = [f"hue_{k:02d}" for k in range(HUE_BINS)]
+
 
 def calculate_wall_scale(holds):
     hold_sizes = [
@@ -17,7 +20,14 @@ def calculate_wall_scale(holds):
     return float(np.median(hold_sizes))
 
 
+def circular_emd(a, b):
+    c = np.cumsum(a - b)
+    return float(np.abs(c - np.median(c)).sum())
+
+
 def create_pair(i, j, wall_scale):
+    hi = np.array([i[col] for col in HUE_COLS], dtype=np.float32)
+    hj = np.array([j[col] for col in HUE_COLS], dtype=np.float32)
     pair = {
         "i_id": i["id"],
         "j_id": j["id"],
@@ -33,14 +43,18 @@ def create_pair(i, j, wall_scale):
         "c95_diff": abs(i["chroma_p95"] - j["chroma_p95"]),
         "chroma_max": max(i["chroma_p75"], j["chroma_p75"]),
         "chroma_min": min(i["chroma_p75"], j["chroma_p75"]),
+        "hue_emd": circular_emd(hi, hj),
+        "hue_conf_diff": abs(i["hue_conf"] - j["hue_conf"]),
+        "hue_conf_max": max(i["hue_conf"], j["hue_conf"]),
+        "hue_conf_min": min(i["hue_conf"], j["hue_conf"]),
         "cat_min": min(i["category_id"], j["category_id"]),
         "cat_max": max(i["category_id"], j["category_id"]),
         "same_cat": int(i["category_id"] == j["category_id"]),
         "area_ratio": min(i["area"], j["area"]) / max(i["area"], j["area"]),
-        "absolute_area": abs(i["area"] - j["area"]) / wall_scale**2,
+        "absolute_area": abs(i["area"] - j["area"]),
         "same_route": int(i["route_id"] == j["route_id"]),
         "i_route": i["route_id"],
-        "j_route": j["route_id"]
+        "j_route": j["route_id"],
     }
     return pair
 

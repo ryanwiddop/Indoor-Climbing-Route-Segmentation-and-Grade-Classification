@@ -10,6 +10,8 @@ import pandas as pd
 
 WHOLE_IMG_PATH = "/home/public/rwiddop/images/"
 ANNOTATIONS_PATH = "/home/public/rwiddop/annotations.json"
+HUE_BINS = 16
+CHROMA_FLOOR = 8.0
     
     
 def load_annotations(annotations_path, image_files):
@@ -26,6 +28,24 @@ def load_annotations(annotations_path, image_files):
             volume_category_id = cat["id"]
             break
     return image_to_annotations, volume_category_id
+
+
+def hue_hist(lab_values, nbins=HUE_BINS, floor=CHROMA_FLOOR):
+    a = lab_values[:, 1] - 128.0
+    b = lab_values[:, 2] - 128.0
+    chroma = np.sqrt(a * a + b * b)
+    keep = chroma >= floor
+    if keep.sum() < 16:
+        return np.full(nbins, 1.0 / nbins), 0.0
+
+    w = chroma[keep]
+    pos = (np.arctan2(b[keep], a[keep]) + np.pi) / (2 * np.pi) * nbins
+    lo = np.floor(pos).astype(int)
+    frac = pos - lo
+    hist = np.zeros(nbins)
+    np.add.at(hist, lo % nbins, w * (1.0 - frac))
+    np.add.at(hist, (lo + 1) % nbins, w * frac)
+    return hist / hist.sum(), float(keep.mean())
 
 
 def extract_clab_from_ann(ann, lab_image):
@@ -56,6 +76,7 @@ def extract_clab_from_ann(ann, lab_image):
     lab_values = lab_image[y:y1, x:x1][sample > 0].astype(np.float32)
     chroma = np.sqrt((lab_values[:, 1] - 128.0) ** 2 + (lab_values[:, 2] - 128.0) ** 2)
     chromatic = lab_values[chroma >= np.percentile(chroma, 75)]
+    hist, hue_conf = hue_hist(lab_values)
 
     # return wall, ann_id, cat, route_id, cx, cy (px), area, med_L, med_a, med_b, chroma_p75, chroma_p95
     return {
@@ -71,6 +92,8 @@ def extract_clab_from_ann(ann, lab_image):
         "med_b": float(np.median(chromatic[:, 2])),
         "chroma_p75": float(np.percentile(chroma, 75)),
         "chroma_p95": float(np.percentile(chroma, 95)),
+        "hue_conf": hue_conf,
+        **{f"hue_{k:02d}": float(v) for k, v in enumerate(hist)},
     }
 
 
