@@ -1,6 +1,3 @@
-# pair:  PR-AUC = 91.39%  Precision = 82.99%  Recall = 87.11%  F1 = 85.00%  @0.40
-# route: recovery@0.8 IoU = 78.43% macro / 72.81% micro  @0.30, average linkage
-
 from collections import defaultdict
 import json
 import os
@@ -142,15 +139,14 @@ def main():
     print(f"{len(walls)} walls, {len(all_pairs)} pairs, {y.mean():.2%} positive")
     print(f"per-wall PR-AUC: mean {fold_ap.mean():.3f}  sd {fold_ap.std():.3f}  "f"min {fold_ap.min():.3f}  max {fold_ap.max():.3f}")
     print(f"pooled PR-AUC:   {average_precision_score(y, oof):.3f}\n")
-    for wall, ap in sorted(zip(walls, fold_ap), key=lambda t: t[1]):
-        print(f"  {wall}  {ap:.3f}")
+    # for wall, ap in sorted(zip(walls, fold_ap), key=lambda t: t[1]):
+    #     print(f"  {wall}  {ap:.3f}")
 
-    print()
     best_threshold, best_f1 = 0.5, 0.0
     for threshold in np.arange(0.30, 0.95, 0.05):
         preds = (oof >= threshold).astype(int)
         f1 = f1_score(y, preds, zero_division=0)
-        print(f"{threshold:.2f}  {precision_score(y, preds, zero_division=0):.4f}  "f"{recall_score(y, preds, zero_division=0):.4f}  {f1:.4f}")
+        # print(f"{threshold:.2f}  {precision_score(y, preds, zero_division=0):.4f}  "f"{recall_score(y, preds, zero_division=0):.4f}  {f1:.4f}")
         if f1 > best_f1:
             best_f1, best_threshold = f1, threshold
 
@@ -192,7 +188,7 @@ def main():
             "pair_recall": float(recall_score(y, preds, zero_division=0)),
             "pair_f1": float(f1_score(y, preds, zero_division=0)),
         })
-        print(f"{threshold:.2f}  recovery@{IOU_MATCH} {per_wall.mean():.4f}  sd {per_wall.std():.4f}")
+        # print(f"{threshold:.2f}  recovery@{IOU_MATCH} {per_wall.mean():.4f}  sd {per_wall.std():.4f}")
         if per_wall.mean() > best_recovery:
             best_recovery, best_route_threshold = per_wall.mean(), threshold
 
@@ -217,10 +213,10 @@ def main():
     print(f"micro: {n_hit}/{n_gt} = {n_hit / n_gt:.4f}   predicted routes {n_pred}")
     ious = np.array([m["iou"] for ms in all_matches.values() for m in ms])
     print(f"matched IoU: median {np.median(ious):.3f}  >=0.5 {(ious >= 0.5).mean():.3f}")
-    print()
-    for image_file, recovery in sorted(per_wall.items(), key=lambda t: t[1]):
-        print(f"  {image_file}  {recovery:.3f}  "
-              f"gt {len(gt_routes[image_file])}  pred {len(predicted_routes[image_file])}")
+    # print()
+    # for image_file, recovery in sorted(per_wall.items(), key=lambda t: t[1]):
+    #     print(f"  {image_file}  {recovery:.3f}  "
+    #           f"gt {len(gt_routes[image_file])}  pred {len(predicted_routes[image_file])}")
 
     with open(f"{OUT_DIR}/metrics.json", "w") as f:
         json.dump({
@@ -238,6 +234,17 @@ def main():
                    "predicted": predicted_routes,
                    "gt": gt_routes,
                    "matches": all_matches}, f, indent=1)
+        
+    note = input("Enter a note for the tuning log: ")
+    with open(f"{OUT_DIR}/tuning.log", "a") as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"{note}\n")
+        f.write(f"route_threshold: {best_route_threshold:.2f}\n")
+        f.write(f"recovery@{IOU_MATCH}: macro {recoveries.mean():.4f}  sd {recoveries.std():.4f}  "
+                f"min {recoveries.min():.4f}  max {recoveries.max():.4f}\n")
+        f.write(f"micro: {n_hit}/{n_gt} = {n_hit / n_gt:.4f}   predicted routes {n_pred}\n")
+        f.write(f"matched IoU: median {np.median(ious):.3f}  >=0.5 {(ious >= 0.5).mean():.3f}\n")
+        f.write("\n")
 
 
 if __name__ == "__main__":
