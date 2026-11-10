@@ -8,6 +8,7 @@ import pandas as pd
 
 WHOLE_IMG_PATH = "/home/public/rwiddop/images/"
 ANNOTATIONS_PATH = "/home/public/rwiddop/annotations.json"
+OUTPUT_PATH = "/home/public/rwiddop/pairwise/all_pairs.csv"
 VOLUME_CATEGORY_ID = 1
 HUE_BINS = 16
 CHROMA_FLOOR = 8.0
@@ -177,7 +178,7 @@ def main():
             all_clab_data.append(clab)
             
     dataset = pd.DataFrame(all_clab_data)
-    dataset.to_csv("clab_data.csv", index=False)
+    # dataset.to_csv("clab_data.csv", index=False)
     
     print(f"Saved {len(dataset)} holds, across {next_id - 1} unique routes, to clab_data.csv")
     print(f"Volume category id: {volume_category_id}")
@@ -203,7 +204,7 @@ def main():
         all_pairs.extend(pairs)
     all_pairs_df = pd.DataFrame(all_pairs)
     # save all pairs DataFrame to a CSV file
-    all_pairs_df.to_csv("all_pairs.csv", index=False)
+    all_pairs_df.to_csv(OUTPUT_PATH, index=False)
     
     print(f"All Pairs DataFrame Shape: {all_pairs_df.shape}")
     print(f"Total Pairs: {len(all_pairs)}")
