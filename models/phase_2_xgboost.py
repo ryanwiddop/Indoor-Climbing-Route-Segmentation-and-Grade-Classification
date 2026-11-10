@@ -1,3 +1,5 @@
+# FOR REPORT:
+# I was trying to figure out a way to group holds into routes using simply color Lab values. That did not work because positional data has significant signal. With an algorithmic approach, it was very hard to extract meaningful route data. It heavily relied on hand tuning parameters such as color binning centroids and distance thresholds. This gave an IoU of roughly 60%. When images with seperate routes of the same color were evaluated, performance deteriorated. So I started thinking in terms of machine learning. I was looking to repurpose the Lab color extraction code but train a model to interpret it instead of tuning centroids. The issue is to do this, every hold must be compared to every other hold
 from collections import defaultdict
 import json
 import os
@@ -13,7 +15,9 @@ NUM_BOOST_ROUND = 400
 N_JOBS = 12
 IOU_MATCH = 0.8
 OUT_DIR = "models/figures/phase_2"
-CATEGORICAL = ["cat_min", "cat_max"]
+MODEL_DIR = "models/checkpoints"
+PAIRWISE_DATASET = "/home/public/rwiddop/pairwise/all_pairs.csv"
+# CATEGORICAL = ["cat_min", "cat_max"]
 PARAMS = {
     "objective": "binary:logistic",
     "eval_metric": "aucpr",
@@ -30,13 +34,13 @@ PARAMS = {
 
 
 def fit_fold(X, y, held_out):
-    dtrain = xgb.DMatrix(X[~held_out], label=y[~held_out], enable_categorical=True)
+    dtrain = xgb.DMatrix(X[~held_out], label=y[~held_out])
     model = xgb.train(PARAMS, dtrain, num_boost_round=NUM_BOOST_ROUND)
-    dtest = xgb.DMatrix(X[held_out], enable_categorical=True)
+    dtest = xgb.DMatrix(X[held_out])
     return model.predict(dtest), model.get_score(importance_type="gain")
 
 
-def group_wall(pairs, threshold, linkage="average"):
+def group_wall(pairs, probs, threshold, linkage="average"):
     ids = sorted(set(pairs["i_id"]) | set(pairs["j_id"]))
     index_of = {hold_id: k for k, hold_id in enumerate(ids)}
     n = len(ids)
@@ -45,7 +49,7 @@ def group_wall(pairs, threshold, linkage="average"):
     np.fill_diagonal(dist, 0.0)
     rows = pairs["i_id"].map(index_of).to_numpy()
     cols = pairs["j_id"].map(index_of).to_numpy()
-    d = 1.0 - pairs["oof_probs"].to_numpy()
+    d = 1.0 - np.asarray(probs)
     dist[rows, cols] = d
     dist[cols, rows] = d
 
@@ -101,7 +105,7 @@ def match_routes(gt_routes, pred_routes):
 
 def wall_recovery(pairs, threshold, linkage="average"):
     gt_routes = image_gt_routes(pairs)
-    pred_routes = group_wall(pairs, threshold, linkage)
+    pred_routes = group_wall(pairs, pairs["oof_probs"], threshold, linkage)
     matches = match_routes(gt_routes, pred_routes)
     hit = sum(1 for m in matches if m["iou"] >= IOU_MATCH)
     return hit / len(gt_routes), gt_routes, pred_routes, matches
@@ -112,12 +116,26 @@ def macro_recovery(all_pairs, threshold, linkage="average"):
         wall_recovery(pairs, threshold, linkage)[0]
         for _, pairs in all_pairs.groupby("image_file")
     ])
+    
+
+def load_model():
+    model = xgb.Booster()
+    model.load_model(f"{MODEL_DIR}/phase_2.json")
+    with open(f"{MODEL_DIR}/phase_2_metadata.json", "r") as f:
+        metadata = json.load(f)
+    return model, metadata
+    
+    
+def predict_routes_per_wall(model, metadata, pairs):
+    X = pairs[metadata["feature_order"]]
+    probs = model.predict(xgb.DMatrix(X))
+    return group_wall(pairs, probs, metadata["route_threshold"], metadata["linkage"])
 
 
 def main():
-    all_pairs = pd.read_csv("all_pairs.csv")
-    for col in CATEGORICAL:
-        all_pairs[col] = all_pairs[col].astype("category")
+    all_pairs = pd.read_csv(PAIRWISE_DATASET)
+    # for col in CATEGORICAL:
+    #     all_pairs[col] = all_pairs[col].astype("category")
 
     walls = sorted(all_pairs["image_file"].unique())
     wall_of = all_pairs["image_file"].values
@@ -202,6 +220,18 @@ def main():
         gt_routes[image_file] = {r: sorted(s) for r, s in gt.items()}
         predicted_routes[image_file] = {str(k): sorted(s) for k, s in enumerate(pred)}
         all_matches[image_file] = matches
+        
+    # save final trained model
+    final_model = xgb.train(PARAMS, xgb.DMatrix(X, label=y), num_boost_round=NUM_BOOST_ROUND)
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    final_model.save_model(f"{MODEL_DIR}/phase_2.json")
+    with open(f"{MODEL_DIR}/phase_2_metadata.json", "w") as f:
+        json.dump({
+            "feature_order": X.columns.tolist(),
+            "route_threshold": float(best_route_threshold),
+            "linkage": "average",
+        }, f, indent=1)
 
     recoveries = np.array(list(per_wall.values()))
     print(f"\nroute threshold {best_route_threshold:.2f}")
