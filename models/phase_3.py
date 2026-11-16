@@ -110,6 +110,13 @@ def route_features(anns, type_of, scale):
     climb = hands[np.argsort(-hands[:, 1])] if len(hands) else hands
     moves = np.linalg.norm(np.diff(climb, axis = 0), axis = 1) if len(climb) > 1 else []
     
+    # adds hold size
+    hand_areas = [a["area"] / scale**2 for a, t in zip(anns, types) if t in HAND_TYPES]
+    foot_areas = [a["area"] / scale**2 for a, t in zip(anns, types) if t == "foot"]
+    
+    row.update(stats("hand_area", hand_areas))
+    row.update(stats("foot_area", foot_areas))
+    
     row.update(stats("move", moves))
     row.update(stats("hand_nn", nearest(hands, hands, same_set = True)))
     row.update(stats("hand_to_foot", nearest(hands, feet)))
@@ -259,7 +266,7 @@ def main():
     cm = confusion_matrix(gt_table["y"], to_grade(gt_table[f"pred_{best}"]), labels = range(len(GRADES)))
     
     print(f"{best} confusion (rows = true, cols = predicted)")
-    print("      " + "".join(f"{g: >5}" for g in GRADES))
+    print("      " + " ".join(f"{g: >5}" for g in GRADES))
     
     for grade, row in zip(GRADES, cm):
         print(f"{grade: >5} " + " ".join(f"{v: >5}" for v in row))
