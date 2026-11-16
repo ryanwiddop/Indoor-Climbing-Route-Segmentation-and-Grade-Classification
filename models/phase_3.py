@@ -13,7 +13,7 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from matplotlib.path import Path
+# from matplotlib.path import Path >> used for volumes, not implemented 11/16
 from sklearn.dummy import DummyRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
@@ -34,8 +34,8 @@ IOU_MATCH = 0.8
 GRADES = ["V0-", "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8+"]
 GRADE_INDEX = {grade: i for i, grade in enumerate(GRADES)}
 
-"""Convert raw grade prediction to the nearest valid grade index. (Rounding)"""
 def to_grade(raw):
+    """Convert raw grade prediction to the nearest valid grade index. (Rounding)"""
     return np.clip(np.rint(raw), 0, len(GRADES) - 1).astype(int)
 
 def load_routes():
@@ -155,6 +155,9 @@ def build_owner_lookup(gt):
                 
     return owner_of, holds_of, grade_of
 
+def feature_columns(table):
+    return sorted([c for c in table.columns if c not in ("wall", "route", "hold_ids", "y", "iou")])
+
 def add_labels(table, owner_of, holds_of, grade_of):
     # y is the grade of the human-labeled route. iou = how well they match
     ys, ious = [], []
@@ -175,3 +178,104 @@ def add_labels(table, owner_of, holds_of, grade_of):
     table["y"] = ys
     table["iou"] = ious
 
+def score(y_true, raw):
+    y_true = np.asarray(y_true, dtype = int)
+    y_pred = to_grade(raw)
+    
+    return {
+        "n": len(y_true),
+        "exact": float(np.mean(y_pred == y_true)),
+        "within_1": float(np.mean(np.abs(y_pred - y_true) <= 1)),
+        "mae": float(np.mean(np.abs(y_pred - y_true))),
+        "qwk": float(cohen_kappa_score(y_true, y_pred, weights="quadratic", labels = list(range(len(GRADES)))))
+    }
+    
+def leave_one_wall_out(make_model, train, features, extra):
+    # Train and extra wall's routes are predicted by a model trained on all other walls
+    train_raw = pd.Series(np.nan, index = train.index)
+    extra_raw = pd.Series(np.nan, index = extra.index)
+    
+    for wall in sorted(train["wall"].unique()):
+        held = train["wall"] == wall
+        model = make_model()
+        model.fit(train.loc[~held, features], train.loc[~held, "y"])
+        train_raw[held] = model.predict(train.loc[held, features])
+        on_wall = extra["wall"] == wall
+        
+        if on_wall.any():
+            extra_raw[on_wall] = model.predict(extra.loc[on_wall, features])
+    
+    return train_raw, extra_raw
+
+MODELS = {
+    "baseline (median)": lambda: DummyRegressor(strategy = "median"),
+    "ridge": lambda: make_pipeline(SimpleImputer(strategy = "median"), StandardScaler(), Ridge(alpha = 10.0)),
+    "xgboost": lambda: xgb.XGBRegressor(
+        n_estimators = 300, max_depth = 3, learning_rate = 0.03, subsample = 0.8,
+        colsample_bytree = 0.6, min_child_weight = 3, random_state = 42, n_jobs = 4)
+}
+
+def print_row(name, m):
+    print(f"{name: <38} n {m['n']: >4} exact {m['exact']: 6.1%} within_1 {m['within_1']: 6.1%}  "
+          f"MAE {m['mae']: .2f} QWK {m['qwk']: .3f}")
+    
+def main():
+    coco, gt, pred = load_routes()
+    lookup = build_owner_lookup(gt)
+    
+    gt_table = build_table(coco, gt)
+    add_labels(gt_table, *lookup)
+    gt_table = gt_table[gt_table["y"].notna()].reset_index(drop = True) # drop INC routes
+    gt_table["y"] = gt_table["y"].astype(int)
+    
+    pred_table = build_table(coco, pred)
+    add_labels(pred_table, *lookup)
+    
+    features = feature_columns(gt_table)
+    print(f"{len(gt_table)} graded routes, {gt_table['wall'].nunique()} walls, {len(features)} features\n")
+    
+    results = {}
+    for name, make_model in MODELS.items():
+        gt_raw, pred_raw = leave_one_wall_out(make_model, gt_table, features, pred_table)
+        graded = pred_table["y"].notna() & pred_raw.notna()
+        matched = graded & (pred_table["iou"] >= IOU_MATCH)
+        
+        results[name] = {
+            "gt": score(gt_table["y"], gt_raw),
+            "phase2_all": score(pred_table.loc[graded, "y"], pred_raw[graded]),
+            "phase2_matched": score(pred_table.loc[matched, "y"], pred_raw[matched])
+        }
+        
+        print_row(f"{name}: labelled routes", results[name]["gt"])
+        print_row(f"{name}: phase 2 routes", results[name]["phase2_all"])
+        print_row(f"{name}: phase 2, IoU >= {IOU_MATCH}", results[name]["phase2_matched"])
+        
+        print()
+        
+        gt_table[f"pred_{name}"] = gt_raw
+        pred_table[f"pred_{name}"] = pred_raw
+        
+    best = "xgboost"
+    cm = confusion_matrix(gt_table["y"], to_grade(gt_table[f"pred_{best}"]), labels = range(len(GRADES)))
+    
+    print(f"{best} confusion (rows = true, cols = predicted)")
+    print("      " + "".join(f"{g: >5}" for g in GRADES))
+    
+    for grade, row in zip(GRADES, cm):
+        print(f"{grade: >5} " + " ".join(f"{v: >5}" for v in row))
+        
+    final = MODELS[best]().fit(gt_table[features], gt_table["y"]) # all wall, for interpretation only
+    importance = pd.Series(final.feature_importances_, index = features).sort_values(ascending = False)
+    
+    print("\ntop features:\n" + importance.head(10).to_string())
+    
+    os.makedirs(OUT_DIR, exist_ok = True)
+    gt_table.drop(columns = features).to_csv(f"{OUT_DIR}/gt_route_grades.csv", index = False)
+    pred_table.drop(columns = features).to_csv(f"{OUT_DIR}/predicted_route_grades.csv", index = False)
+    
+    with open(f"{OUT_DIR}/metrics.json", "w") as f:
+        json.dump({"grades": GRADES, "results": results, "confusion": cm.tolist(),
+                  "importance": importance.to_dict()}, f, indent = 1)
+        
+if __name__ == "__main__":
+    main()
